@@ -175,6 +175,10 @@ int ObjBencher::aio_bench(
 	cerr << "Must write data before running a read benchmark!" << std::endl;
       return r;
     }
+    // this treats maxObjects (if specified) as a limit for reads as well
+    if (maxObjectsToCreate > 0 && maxObjectsToCreate < num_objects) {
+      num_objects = maxObjectsToCreate;
+    }
   } else {
     object_size = op_size;
   }
