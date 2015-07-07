@@ -40,6 +40,7 @@ using namespace librados;
 #include <stdexcept>
 #include <climits>
 #include <locale>
+#include <vector>
 
 #include "cls/lock/cls_lock_client.h"
 #include "include/compat.h"
@@ -89,7 +90,7 @@ void usage(ostream& out)
 "   rollback <obj-name> <snap-name>  roll back object to snap <snap-name>\n"
 "\n"
 "   listsnaps <obj-name>             list the snapshots of this object\n"
-"   bench <seconds> write|seq|rand [-t concurrent_operations] [--no-cleanup] [--run-name run_name]\n"
+"   bench <seconds> write|seq|rand [-t concurrent_operations] [--no-cleanup] [--run-name run_name] [--name-file namefile]\n"
 "                                    default is 16 concurrent IOs and 4 MB ops\n"
 "                                    default is to clean up after write benchmark\n"
 "                                    default run-name is 'benchmark_last_metadata'\n"
@@ -794,6 +795,8 @@ class RadosBencher : public ObjBencher {
   librados::IoCtx& io_ctx;
   librados::NObjectIterator oi;
   bool iterator_valid;
+  const char* name_file;
+  std::vector<std::string> name_vector;
 protected:
   int completions_init(int concurrentios) {
     completions = new librados::AioCompletion *[concurrentios];
@@ -874,9 +877,30 @@ protected:
     return true;
   }
 
+  std::string generate_object_name(int objnum, int pid)
+  {
+    if (name_file == NULL) {
+      return ObjBencher::generate_object_name(objnum, pid);
+    } else {
+      return  name_vector.at(objnum);
+    }
+  }
+
 public:
-  RadosBencher(CephContext *cct_, librados::Rados& _r, librados::IoCtx& _i)
-    : ObjBencher(cct_), completions(NULL), rados(_r), io_ctx(_i), iterator_valid(false) {}
+  RadosBencher(CephContext *cct_, librados::Rados& _r, librados::IoCtx& _i, const char *name_file)
+  : ObjBencher(cct_), completions(NULL), rados(_r), io_ctx(_i), iterator_valid(false), name_file(name_file)
+  {
+    // if name_file specified, read it in now
+    if (name_file != NULL) {
+      ifstream file(name_file);
+      if(file.is_open()) {
+	string tmp;
+	while (file >> tmp) {
+	  name_vector.push_back(tmp);
+	}
+      }
+    }
+  }
   ~RadosBencher() { }
 };
 
@@ -1161,6 +1185,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
   bool wildcard = false;
 
   const char* run_name = NULL;
+  const char* name_file = NULL;
   const char* prefix = NULL;
 
   Formatter *formatter = NULL;
@@ -1202,6 +1227,10 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
   i = opts.find("run-name");
   if (i != opts.end()) {
     run_name = i->second.c_str();
+  }
+  i = opts.find("name-file");
+  if (i != opts.end()) {
+    name_file = i->second.c_str();
   }
   i = opts.find("prefix");
   if (i != opts.end()) {
@@ -2259,7 +2288,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       operation = OP_RAND_READ;
     else
       usage_exit();
-    RadosBencher bencher(g_ceph_context, rados, io_ctx);
+    RadosBencher bencher(g_ceph_context, rados, io_ctx, name_file);
     bencher.set_show_time(show_time);
     ret = bencher.aio_bench(operation, seconds, num_objs,
 			    concurrent_ios, op_size, cleanup, run_name);
@@ -2269,7 +2298,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
   else if (strcmp(nargs[0], "cleanup") == 0) {
     if (!pool_name)
       usage_exit();
-    RadosBencher bencher(g_ceph_context, rados, io_ctx);
+    RadosBencher bencher(g_ceph_context, rados, io_ctx, name_file);
     ret = bencher.clean_up(prefix, concurrent_ios, run_name);
     if (ret != 0)
       cerr << "error during cleanup: " << ret << std::endl;
@@ -2643,6 +2672,8 @@ int main(int argc, const char **argv)
       opts["no-cleanup"] = "true";
     } else if (ceph_argparse_witharg(args, i, &val, "--run-name", (char*)NULL)) {
       opts["run-name"] = val;
+    } else if (ceph_argparse_witharg(args, i, &val, "--name-file", (char*)NULL)) {
+      opts["name-file"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--prefix", (char*)NULL)) {
       opts["prefix"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "-p", "--pool", (char*)NULL)) {

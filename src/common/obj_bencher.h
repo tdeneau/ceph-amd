@@ -93,6 +93,10 @@ protected:
 
   ostream& out(ostream& os);
   ostream& out(ostream& os, utime_t& t);
+
+protected:
+  virtual std::string generate_object_name(int objnum, int pid = 0);
+
 public:
   ObjBencher(CephContext *cct_) : show_time(false), cct(cct_), lock("ObjBencher::lock") {}
   virtual ~ObjBencher() {}

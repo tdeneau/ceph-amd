@@ -45,7 +45,7 @@ static std::string generate_object_prefix(int pid = 0) {
   return oss.str();
 }
 
-static std::string generate_object_name(int objnum, int pid = 0)
+std::string ObjBencher::generate_object_name(int objnum, int pid)
 {
   std::ostringstream oss;
   oss << generate_object_prefix(pid) << "_object" << objnum;
@@ -496,6 +496,9 @@ int ObjBencher::seq_read_bench(int seconds_to_run, int num_objects, int concurre
   if (concurrentios <= 0) 
     return -EINVAL;
 
+  if (num_objects > 0 && concurrentios > num_objects)
+    concurrentios = num_objects;
+
   std::vector<string> name(concurrentios);
   std::string newName;
   bufferlist* contents[concurrentios];
@@ -683,6 +686,9 @@ int ObjBencher::rand_read_bench(int seconds_to_run, int num_objects, int concurr
 
   if (concurrentios <= 0) 
     return -EINVAL;
+
+  if (num_objects > 0 && concurrentios > num_objects)
+    concurrentios = num_objects;
  
   std::vector<string> name(concurrentios);
   std::string newName;
