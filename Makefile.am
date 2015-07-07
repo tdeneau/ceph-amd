@@ -2,13 +2,14 @@ AUTOMAKE_OPTIONS = gnu
 ACLOCAL_AMFLAGS = -I m4
 EXTRA_DIST = autogen.sh ceph.spec.in ceph.spec install-deps.sh
 # the "." here makes sure check-local builds gtest and gmock before they are used
-SUBDIRS = . src man
+SUBDIRS = . src man doc
 
 EXTRA_DIST += \
 	src/test/run-cli-tests \
 	src/test/run-cli-tests-maybe-unset-ccache \
 	src/test/cli \
 	src/test/downloads \
+	systemd/ceph.tmpfiles.d \
 	udev/50-rbd.rules \
 	udev/60-ceph-partuuid-workaround.rules \
 	udev/95-ceph-osd.rules \

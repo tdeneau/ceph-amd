@@ -236,7 +236,7 @@ void PG::lock_suspend_timeout(ThreadPool::TPHandle &handle)
   handle.reset_tp_timeout();
 }
 
-void PG::lock(bool no_lockdep)
+void PG::lock(bool no_lockdep) const
 {
   _lock.Lock(no_lockdep);
   // if we have unrecorded dirty state with the lock dropped, there is a bug
@@ -457,6 +457,18 @@ bool PG::MissingLoc::readable_with_acting(
   return (*is_readable)(have_acting);
 }
 
+void PG::MissingLoc::add_batch_sources_info(
+  const set<pg_shard_t> &sources)
+{
+  dout(10) << __func__ << ": adding sources in batch " << sources.size() << dendl;
+  for (map<hobject_t, pg_missing_t::item>::const_iterator i = needs_recovery_map.begin(); 
+      i != needs_recovery_map.end();
+      ++i) {
+    missing_loc[i->first].insert(sources.begin(), sources.end());
+    missing_loc_sources.insert(sources.begin(), sources.end());
+    }
+}
+
 bool PG::MissingLoc::add_source_info(
   pg_shard_t fromosd,
   const pg_info_t &oinfo,
@@ -572,21 +584,17 @@ bool PG::needs_recovery() const
 {
   assert(is_primary());
 
-  bool ret = false;
-
   const pg_missing_t &missing = pg_log.get_missing();
 
   if (missing.num_missing()) {
     dout(10) << __func__ << " primary has " << missing.num_missing()
       << " missing" << dendl;
-
-    ret = true;
+    return true;
   }
 
   assert(!actingbackfill.empty());
   set<pg_shard_t>::const_iterator end = actingbackfill.end();
   set<pg_shard_t>::const_iterator a = actingbackfill.begin();
-  assert(a != end);
   for (; a != end; ++a) {
     if (*a == get_primary()) continue;
     pg_shard_t peer = *a;
@@ -594,19 +602,17 @@ bool PG::needs_recovery() const
     if (pm == peer_missing.end()) {
       dout(10) << __func__ << " osd." << peer << " doesn't have missing set"
         << dendl;
-      ret = true;
       continue;
     }
     if (pm->second.num_missing()) {
       dout(10) << __func__ << " osd." << peer << " has "
         << pm->second.num_missing() << " missing" << dendl;
-      ret = true;
+      return true;
     }
   }
 
-  if (!ret)
-    dout(10) << __func__ << " is recovered" << dendl;
-  return ret;
+  dout(10) << __func__ << " is recovered" << dendl;
+  return false;
 }
 
 bool PG::needs_backfill() const
@@ -791,6 +797,8 @@ bool PG::all_unfound_are_queried_or_lost(const OSDMapRef osdmap) const
     map<pg_shard_t, pg_info_t>::const_iterator iter = peer_info.find(*peer);
     if (iter != peer_info.end() &&
         (iter->second.is_empty() || iter->second.dne()))
+      continue;
+    if (!osdmap->exists(peer->osd))
       continue;
     const osd_info_t &osd_info(osdmap->get_info(peer->osd));
     if (osd_info.lost_at <= osd_info.up_from) {
@@ -1666,14 +1674,19 @@ void PG::activate(ObjectStore::Transaction& t,
     }
 
     // Set up missing_loc
+    set<pg_shard_t> complete_shards;
     for (set<pg_shard_t>::iterator i = actingbackfill.begin();
 	 i != actingbackfill.end();
 	 ++i) {
       if (*i == get_primary()) {
-	missing_loc.add_active_missing(pg_log.get_missing());
+	missing_loc.add_active_missing(missing);
+        if (!missing.have_missing())
+          complete_shards.insert(*i);
       } else {
 	assert(peer_missing.count(*i));
 	missing_loc.add_active_missing(peer_missing[*i]);
+        if (!peer_missing[*i].have_missing() && peer_info[*i].last_backfill == hobject_t::get_max())
+          complete_shards.insert(*i);
       }
     }
     // If necessary, create might_have_unfound to help us find our unfound objects.
@@ -1681,19 +1694,27 @@ void PG::activate(ObjectStore::Transaction& t,
     // past intervals.
     might_have_unfound.clear();
     if (needs_recovery()) {
-      missing_loc.add_source_info(pg_whoami, info, pg_log.get_missing(), ctx->handle);
-      for (set<pg_shard_t>::iterator i = actingbackfill.begin();
-	   i != actingbackfill.end();
-	   ++i) {
-	if (*i == pg_whoami) continue;
-	dout(10) << __func__ << ": adding " << *i << " as a source" << dendl;
-	assert(peer_missing.count(*i));
-	assert(peer_info.count(*i));
-	missing_loc.add_source_info(
-	  *i,
-	  peer_info[*i],
-	  peer_missing[*i],
-          ctx->handle);
+      // If only one shard has missing, we do a trick to add all others as recovery
+      // source, this is considered safe since the PGLogs have been merged locally,
+      // and covers vast majority of the use cases, like one OSD/host is down for
+      // a while for hardware repairing
+      if (complete_shards.size() + 1 == actingbackfill.size()) {
+        missing_loc.add_batch_sources_info(complete_shards);
+      } else {
+        missing_loc.add_source_info(pg_whoami, info, pg_log.get_missing(), ctx->handle);
+        for (set<pg_shard_t>::iterator i = actingbackfill.begin();
+	     i != actingbackfill.end();
+	     ++i) {
+	  if (*i == pg_whoami) continue;
+	  dout(10) << __func__ << ": adding " << *i << " as a source" << dendl;
+	  assert(peer_missing.count(*i));
+	  assert(peer_info.count(*i));
+	  missing_loc.add_source_info(
+	    *i,
+	    peer_info[*i],
+	    peer_missing[*i],
+            ctx->handle);
+        }
       }
       for (map<pg_shard_t, pg_missing_t>::iterator i = peer_missing.begin();
 	   i != peer_missing.end();
@@ -2699,31 +2720,27 @@ void PG::_upgrade_v7(ObjectStore *store, const interval_set<snapid_t> &snapcolls
   }
 }
 
-int PG::_write_info(ObjectStore::Transaction& t, epoch_t epoch,
-		    pg_info_t &info, coll_t coll,
-		    map<epoch_t,pg_interval_t> &past_intervals,
-		    ghobject_t &pgmeta_oid,
-		    bool dirty_big_info)
+int PG::_prepare_write_info(map<string,bufferlist> *km,
+			    epoch_t epoch,
+			    pg_info_t &info, coll_t coll,
+			    map<epoch_t,pg_interval_t> &past_intervals,
+			    ghobject_t &pgmeta_oid,
+			    bool dirty_big_info)
 {
-  // pg state
-  map<string,bufferlist> v;
-
   // info.  store purged_snaps separately.
   interval_set<snapid_t> purged_snaps;
-  ::encode(epoch, v[epoch_key]);
+  ::encode(epoch, (*km)[epoch_key]);
   purged_snaps.swap(info.purged_snaps);
-  ::encode(info, v[info_key]);
+  ::encode(info, (*km)[info_key]);
   purged_snaps.swap(info.purged_snaps);
 
   if (dirty_big_info) {
     // potentially big stuff
-    bufferlist& bigbl = v[biginfo_key];
+    bufferlist& bigbl = (*km)[biginfo_key];
     ::encode(past_intervals, bigbl);
     ::encode(info.purged_snaps, bigbl);
     //dout(20) << "write_info bigbl " << bigbl.length() << dendl;
   }
-
-  t.omap_setkeys(coll, pgmeta_oid, v);
 
   return 0;
 }
@@ -2757,14 +2774,14 @@ void PG::_init(ObjectStore::Transaction& t, spg_t pgid, const pg_pool_t *pool)
   t.omap_setkeys(coll, pgmeta_oid, values);
 }
 
-void PG::write_info(ObjectStore::Transaction& t)
+void PG::prepare_write_info(map<string,bufferlist> *km)
 {
   info.stats.stats.add(unstable_stats);
   unstable_stats.clear();
 
-  int ret = _write_info(t, get_osdmap()->get_epoch(), info, coll,
-			past_intervals, pgmeta_oid,
-			dirty_big_info);
+  int ret = _prepare_write_info(km, get_osdmap()->get_epoch(), info, coll,
+				past_intervals, pgmeta_oid,
+				dirty_big_info);
   assert(ret == 0);
   last_persisted_osdmap_ref = osdmap_ref;
 
@@ -2867,9 +2884,12 @@ epoch_t PG::peek_map_epoch(ObjectStore *store,
 
 void PG::write_if_dirty(ObjectStore::Transaction& t)
 {
+  map<string,bufferlist> km;
   if (dirty_big_info || dirty_info)
-    write_info(t);
-  pg_log.write_log(t, coll, pgmeta_oid);
+    prepare_write_info(&km);
+  pg_log.write_log(t, &km, coll, pgmeta_oid);
+  if (!km.empty())
+    t.omap_setkeys(coll, pgmeta_oid, km);
 }
 
 void PG::trim_peers()
@@ -2894,7 +2914,7 @@ void PG::trim_peers()
   }
 }
 
-void PG::add_log_entry(const pg_log_entry_t& e, bufferlist& log_bl)
+void PG::add_log_entry(const pg_log_entry_t& e)
 {
   // raise last_complete only if we were previously up to date
   if (info.last_complete == info.last_update)
@@ -2912,8 +2932,6 @@ void PG::add_log_entry(const pg_log_entry_t& e, bufferlist& log_bl)
   // log mutation
   pg_log.add(e);
   dout(10) << "add_log_entry " << e << dendl;
-
-  e.encode_with_checksum(log_bl);
 }
 
 
@@ -2937,11 +2955,10 @@ void PG::append_log(
   }
   dout(10) << "append_log " << pg_log.get_log() << " " << logv << dendl;
 
-  map<string,bufferlist> keys;
   for (vector<pg_log_entry_t>::const_iterator p = logv.begin();
        p != logv.end();
        ++p) {
-    add_log_entry(*p, keys[p->get_key_name()]);
+    add_log_entry(*p);
   }
 
   PGLogEntryHandler handler;
@@ -2962,9 +2979,6 @@ void PG::append_log(
 	get_osdmap()->get_epoch(),
 	trim_rollback_to));
   }
-
-  dout(10) << "append_log  adding " << keys.size() << " keys" << dendl;
-  t.omap_setkeys(coll, pgmeta_oid, keys);
 
   pg_log.trim(&handler, trim_to, info);
 
@@ -3327,6 +3341,11 @@ void PG::sub_op_scrub_map(OpRequestRef op)
     return;
   }
 
+  if (!scrubber.is_chunky_scrub_active()) {
+    dout(10) << "sub_op_scrub_map scrub isn't active" << dendl;
+    return;
+  }
+
   op->mark_started();
 
   dout(10) << " got " << m->from << " scrub map" << dendl;
@@ -3672,15 +3691,20 @@ void PG::repair_object(
     assert(waiting_for_unreadable_object.empty());
 
     pg_log.missing_add(soid, oi.version, eversion_t());
-    missing_loc.add_missing(soid, oi.version, eversion_t());
-    list<pair<ScrubMap::object, pg_shard_t> >::iterator i;
-    for (i = ok_peers->begin();
-	 i != ok_peers->end();
-	 ++i)
-      missing_loc.add_location(soid, i->second);
 
     pg_log.set_last_requested(0);
     dout(10) << __func__ << ": primary = " << primary << dendl;
+  }
+
+  if (is_ec_pg() || bad_peer == primary) {
+    // we'd better collect all shard for EC pg, and prepare good peers as the
+    // source of pull in the case of replicated pg.
+    missing_loc.add_missing(soid, oi.version, eversion_t());
+    list<pair<ScrubMap::object, pg_shard_t> >::iterator i;
+    for (i = ok_peers->begin();
+	i != ok_peers->end();
+	++i)
+      missing_loc.add_location(soid, i->second);
   }
 }
 
@@ -3754,6 +3778,10 @@ void PG::replica_scrub(
 void PG::scrub(ThreadPool::TPHandle &handle)
 {
   lock();
+  if (deleting) {
+    unlock();
+    return;
+  }
   if (g_conf->osd_scrub_sleep > 0 &&
       (scrubber.state == PG::Scrubber::NEW_CHUNK ||
        scrubber.state == PG::Scrubber::INACTIVE)) {
@@ -3764,10 +3792,6 @@ void PG::scrub(ThreadPool::TPHandle &handle)
     t.sleep();
     lock();
     dout(20) << __func__ << " slept for " << t << dendl;
-  }
-  if (deleting) {
-    unlock();
-    return;
   }
 
   if (!is_primary() || !is_active() || !is_clean() || !is_scrubbing()) {
@@ -4231,8 +4255,9 @@ void PG::scrub_process_inconsistent()
   bool repair = state_test(PG_STATE_REPAIR);
   bool deep_scrub = state_test(PG_STATE_DEEP_SCRUB);
   const char *mode = (repair ? "repair": (deep_scrub ? "deep-scrub" : "scrub"));
-
-  if (!scrubber.authoritative.empty() || !scrubber.inconsistent.empty()) {
+  
+  // authoriative only store objects which missing or inconsistent.
+  if (!scrubber.authoritative.empty()) {
     stringstream ss;
     ss << info.pgid << " " << mode << " "
        << scrubber.missing.size() << " missing, "

@@ -26,25 +26,15 @@ using std::set;
 
 class MDS;
 class Session;
-class CDir;
 class CInode;
 class CDentry;
-class EMetaBlob;
 struct SnapRealm;
 
 class Message;
 
-class MDiscover;
-class MDiscoverReply;
-class MCacheExpire;
-class MDirUpdate;
-class MDentryUnlink;
 class MLock;
 
-class MClientRequest;
-
 class Capability;
-class LogSegment;
 
 class SimpleLock;
 class ScatterLock;
@@ -203,7 +193,7 @@ public:
   void handle_client_caps(class MClientCaps *m);
   void _update_cap_fields(CInode *in, int dirty, MClientCaps *m, inode_t *pi);
   void _do_snap_update(CInode *in, snapid_t snap, int dirty, snapid_t follows, client_t client, MClientCaps *m, MClientCaps *ack);
-  void _do_null_snapflush(CInode *head_in, client_t client, snapid_t follows);
+  void _do_null_snapflush(CInode *head_in, client_t client);
   bool _do_cap_update(CInode *in, Capability *cap, int dirty, snapid_t follows, MClientCaps *m,
 		      MClientCaps *ack=0);
   void handle_client_cap_release(class MClientCapRelease *m);

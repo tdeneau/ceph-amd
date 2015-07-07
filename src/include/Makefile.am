@@ -90,6 +90,8 @@ noinst_HEADERS += \
 	include/elist.h \
 	include/uuid.h \
 	include/xlist.h \
+	include/compact_map.h \
+	include/compact_set.h \
 	include/rados/librados.h \
 	include/rados/rados_types.h \
 	include/rados/rados_types.hpp \
@@ -103,6 +105,7 @@ noinst_HEADERS += \
 	include/rbd/features.h \
 	include/rbd/librbd.h \
 	include/rbd/librbd.hpp\
+	include/rbd/object_map_types.h \
 	include/util.h\
 	include/stat.h \
 	include/on_exit.h \

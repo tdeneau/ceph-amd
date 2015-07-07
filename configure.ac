@@ -8,7 +8,7 @@ AC_PREREQ(2.59)
 # VERSION define is not used by the code.  It gets a version string
 # from 'git describe'; see src/ceph_ver.[ch]
 
-AC_INIT([ceph], [0.94.1], [ceph-devel@vger.kernel.org])
+AC_INIT([ceph], [9.0.1], [ceph-devel@vger.kernel.org])
 
 # Create release string.  Used with VERSION for RPMs.
 RPM_RELEASE=0
@@ -20,6 +20,9 @@ if test -d ".git" ; then
   fi
 fi
 AC_MSG_NOTICE([RPM_RELEASE='$RPM_RELEASE'])
+
+AC_CHECK_PROGS(SPHINX_BUILD, sphinx-1.0-build sphinx-build, no)
+AM_CONDITIONAL(HAS_SPHINX_BUILD, test x"$SPHINX_BUILD" != "xno")
 
 AC_CONFIG_MACRO_DIR([m4])
 
@@ -270,6 +273,12 @@ if test x"$linux" = x"yes" -a x"$with_rbd" = x"yes"; then
     AC_MSG_ERROR([libudev.h not found (libudev-dev, libudev-devel)]))
   AC_CHECK_LIB([udev], [udev_monitor_receive_device], [true],
     AC_MSG_FAILURE([libudev not found]))
+
+  # libexpat
+  AC_CHECK_HEADER([expat.h], [],
+    AC_MSG_ERROR([expat.h not found (libexpat-devel)]))
+  AC_CHECK_LIB([expat], [XML_Parse], [true],
+    AC_MSG_FAILURE([libexpat not found]))
 fi
 
 #
@@ -376,6 +385,12 @@ elif test "x$have_nss" = "xyes"; then
 else
     AC_MSG_FAILURE([no suitable crypto library found])
 fi
+
+AC_ARG_ENABLE(gitversion,
+    [AC_HELP_STRING([--enable-gitversion], [build Ceph with git version string])],
+    [], [enable_gitversion=yes])
+
+AM_CONDITIONAL(NO_GIT_VERSION, [test "x$enable_gitversion" = "xno"])
 
 AC_ARG_ENABLE([root-make-check],
             [AS_HELP_STRING([--enable-root-make-check], [enable make check tests that require root privileges])],
@@ -500,6 +515,26 @@ AS_IF([test "x$with_jemalloc" = xyes],
 		  [no jemalloc found (do not use --with-jemalloc)])])])
 AM_CONDITIONAL(WITH_JEMALLOC, [test "$HAVE_LIBJEMALLOC" = "1"])
 
+# tcmalloc-minimal?
+AC_ARG_WITH([tcmalloc-minimal],
+	    [AS_HELP_STRING([--with-tcmalloc-minimal], [enable minimal tcmalloc support for memory allocations])],
+	    [],
+	    [with_tcmalloc_minimal=no])
+
+AS_IF([test "x$with_jemalloc" = "xyes"],[with_tcmalloc_minimal=no],[])
+
+TCMALLOC_MINIMAL=
+AS_IF([test "x$with_tcmalloc_minimal" != xno],
+        [AC_CHECK_LIB([tcmalloc_minimal], [malloc],
+         [AC_SUBST([LIBTCMALLOC], ["-ltcmalloc_minimal"])
+	       AC_DEFINE([HAVE_LIBTCMALLOC_MINIMAL], [1],
+	       		 [Define if you have tcmalloc])
+	       HAVE_LIBTCMALLOC_MINIMAL=1
+	     ],
+	    [AC_MSG_FAILURE(
+		  [no tcmalloc found (do not use --with-tcmalloc-minimal)])])])
+AM_CONDITIONAL(WITH_TCMALLOC_MINIMAL, [test "$HAVE_LIBTCMALLOC_MINIMAL" = "1"])
+
 # tcmalloc?
 AC_ARG_WITH([tcmalloc],
 	    [AS_HELP_STRING([--without-tcmalloc], [disable tcmalloc for memory allocations])],
@@ -507,6 +542,7 @@ AC_ARG_WITH([tcmalloc],
 	    [with_tcmalloc=yes])
 
 AS_IF([test "x$with_jemalloc" = "xyes"],[with_tcmalloc=no],[])
+AS_IF([test "x$with_tcmalloc_minimal" = "xyes"],[with_tcmalloc=no],[])
 
 TCMALLOC=
 AS_IF([test "x$with_tcmalloc" != xno],
@@ -530,8 +566,10 @@ fi
 #set pg ref debugging?
 AC_ARG_ENABLE([pgrefdebugging],
 	    [AS_HELP_STRING([--enable-pgrefdebugging], [enable pg ref debugging])],
-			[AC_DEFINE([PG_DEBUG_REFS], [1], [Defined if you want pg ref debugging])],
-			[])
+			[], [enable_pgrefdebugging=no])
+AS_IF([test "x$enable_pgrefdebugging" = "xyes"],
+	  [AC_DEFINE([PG_DEBUG_REFS], [1], [Defined if you want pg ref debugging])],
+	  [])
 
 #
 # Java is painful
@@ -702,6 +740,7 @@ fi
 # Find supported SIMD / NEON / SSE extensions supported by the compiler
 AX_ARM_FEATURES()
 AM_CONDITIONAL(HAVE_NEON, [ test "x$ax_cv_support_neon_ext" = "xyes"])
+AM_CONDITIONAL(HAVE_ARMV8_CRC, [ test "x$ax_cv_support_crc_ext" = "xyes"])
 AX_INTEL_FEATURES()
 AM_CONDITIONAL(HAVE_SSSE3, [ test "x$ax_cv_support_ssse3_ext" = "xyes"])
 AM_CONDITIONAL(HAVE_SSE4_PCLMUL, [ test "x$ax_cv_support_pclmuldq_ext" = "xyes"])
@@ -772,6 +811,12 @@ AC_ARG_WITH([rest-bench],
 	    [],
 	    [with_rest_bench=no])
 AM_CONDITIONAL(WITH_REST_BENCH, [ test "$with_rest_bench" = "yes" ])
+
+# needs libcurl and libxml2
+if test "x$with_rest_bench" = xyes && test "x$with_system_libs3" = xno; then
+   AC_CHECK_LIB([curl], [curl_easy_init], [], AC_MSG_ERROR([libcurl not found]))
+   AC_CHECK_LIB([xml2], [xmlParseChunk], [], AC_MSG_ERROR([libxml2 not found]))
+fi
 
 # use libaio?
 AC_ARG_WITH([libaio],
@@ -1096,7 +1141,16 @@ AM_COND_IF([WITH_BABELTRACE], [
     AC_MSG_ERROR([babeltrace/ctf/events.h not found (libbabeltrace-ctf-dev, libbabeltrace-devel)]))
 ])
 
+dnl check for valgrind
+AC_ARG_ENABLE([valgrind],
+              [AS_HELP_STRING([--enable-valgrind], [enable valgrind unit tests])],
+              [enable_valgrind=$enableval], [enable_valgrind=])
+AC_CHECK_PROG(HAVE_VALGRIND, valgrind, yes)
+AS_IF([test "x$HAVE_VALGRIND" = "x"],
+  AS_IF([test "x$enable_valgrind" = "xyes"], [AC_MSG_ERROR([valgrind not found])]),
+  [test "x$enable_valgrind" = "x"], [enable_valgrind=yes])
 
+AM_CONDITIONAL([VALGRIND_ENABLED], [test "x$enable_valgrind" = "xyes"])
 
 # Checks for typedefs, structures, and compiler characteristics.
 #AC_HEADER_STDBOOL
@@ -1159,5 +1213,6 @@ AC_CONFIG_FILES([Makefile
 	src/java/Makefile
 	src/tracing/Makefile
 	man/Makefile
+	doc/Makefile
 	ceph.spec])
 AC_OUTPUT

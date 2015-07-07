@@ -1,3 +1,5 @@
+:orphan:
+
 ==================================
  ceph -- ceph administration tool
 ==================================
@@ -12,6 +14,10 @@ Synopsis
 | **ceph** **compact**
 
 | **ceph** **config-key** [ *del* | *exists* | *get* | *list* | *put* ] ...
+
+| **ceph** **daemon** *<name>* \| *<path>* *<command>* ...
+
+| **ceph** **daemonperf** *<name>* \| *<path>* [ *interval* [ *count* ] ]
 
 | **ceph** **df** *{detail}*
 
@@ -200,6 +206,30 @@ Subcommand ``put`` puts configuration key and values.
 Usage::
 
 	ceph config-key put <key> {<val>}
+
+
+daemon
+------
+
+Submit admin-socket commands.
+
+Usage::
+
+	ceph daemon {daemon_name|socket_path} {command} ...
+
+Example::
+
+	ceph daemon osd.0 help
+
+
+daemonperf
+----------
+
+Watch performance counters from a Ceph daemon.
+
+Usage::
+
+	ceph daemonperf {daemon_name|socket_path} [{interval} [{count}]]
 
 
 df
@@ -853,6 +883,10 @@ Only for tiered pools::
 Only for erasure coded pools::
 
 	ceph osd pool get <poolname> erasure_code_profile
+
+Use ``all`` to get all pool parameters that apply to the pool's type::
+
+	ceph osd pool get <poolname> all
 
 Subcommand ``get-quota`` obtains object or byte limits for pool.
 

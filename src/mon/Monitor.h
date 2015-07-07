@@ -47,7 +47,6 @@
 
 #include "messages/MMonCommand.h"
 #include "messages/MPing.h"
-#include "mon/MonitorStore.h"
 #include "mon/MonitorDBStore.h"
 
 #include <memory>
@@ -232,7 +231,7 @@ private:
   set<string> outside_quorum;
 
   /**
-   * @defgroup scrub
+   * @defgroup Monitor_h_scrub
    * @{
    */
   version_t scrub_version;            ///< paxos version we are scrubbing
@@ -250,7 +249,7 @@ private:
   void scrub_reset();
 
   /**
-   * @defgroup Synchronization
+   * @defgroup Monitor_h_sync Synchronization
    * @{
    */
   /**

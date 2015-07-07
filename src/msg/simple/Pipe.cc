@@ -1350,7 +1350,11 @@ void Pipe::fault(bool onread)
   if (policy.lossy && state != STATE_CONNECTING) {
     ldout(msgr->cct,10) << "fault on lossy channel, failing" << dendl;
 
+    // disconnect from Connection, and mark it failed.  future messages
+    // will be dropped.
+    assert(connection_state);
     stop();
+    bool cleared = connection_state->clear_pipe(this);
 
     // crib locks, blech.  note that Pipe is now STATE_CLOSED and the
     // rank_pipe entry is ignored by others.
@@ -1372,11 +1376,7 @@ void Pipe::fault(bool onread)
       delay_thread->discard();
     in_q->discard_queue(conn_id);
     discard_out_queue();
-
-    // disconnect from Connection, and mark it failed.  future messages
-    // will be dropped.
-    assert(connection_state);
-    if (connection_state->clear_pipe(this))
+    if (cleared)
       msgr->dispatch_queue.queue_reset(connection_state.get());
     return;
   }
@@ -1694,10 +1694,8 @@ void Pipe::writer()
 			<< " policy.server=" << policy.server << dendl;
 
     // standby?
-    if (is_queued() && state == STATE_STANDBY && !policy.server) {
-      connect_seq++;
+    if (is_queued() && state == STATE_STANDBY && !policy.server)
       state = STATE_CONNECTING;
-    }
 
     // connect?
     if (state == STATE_CONNECTING) {
@@ -1798,8 +1796,8 @@ void Pipe::writer()
 	m->encode(features, msgr->crcflags);
 
 	// prepare everything
-	ceph_msg_header& header = m->get_header();
-	ceph_msg_footer& footer = m->get_footer();
+	const ceph_msg_header& header = m->get_header();
+	const ceph_msg_footer& footer = m->get_footer();
 
 	// Now that we have all the crcs calculated, handle the
 	// digital signature for the message, if the pipe has session
@@ -2237,7 +2235,7 @@ int Pipe::write_keepalive2(char tag, const utime_t& t)
 }
 
 
-int Pipe::write_message(ceph_msg_header& header, ceph_msg_footer& footer, bufferlist& blist)
+int Pipe::write_message(const ceph_msg_header& header, const ceph_msg_footer& footer, bufferlist& blist)
 {
   int ret;
 

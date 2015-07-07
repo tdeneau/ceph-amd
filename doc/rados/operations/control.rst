@@ -168,13 +168,6 @@ Query the current max_osd parameter in the OSD map. ::
 
 	ceph osd getmaxosd
 
-Import the given OSD map. Note that this can be a bit dangerous,
-since the OSD map includes dynamic state about which OSDs are current
-on or offline; only do this if you've just modified a (very) recent
-copy of the map. ::
-
-	ceph osd setmap -i file
-
 Import the given crush map. ::
 
 	ceph osd setcrushmap -i file
@@ -286,7 +279,10 @@ Sends a repair command to OSD.N. To send the command to all OSDs, use ``*``. ::
 
 Runs a simple throughput benchmark against OSD.N, writing ``NUMBER_OF_OBJECTS``
 in write requests of ``BYTES_PER_WRITE`` each. By default, the test
-writes 1 GB in total in 4-MB increments. ::
+writes 1 GB in total in 4-MB increments.
+The benchmark is non-destructive and will not overwrite existing live
+OSD data, but might temporarily affect the performance of clients
+concurrently accessing the OSD. ::
 
 	ceph tell osd.N bench [NUMER_OF_OBJECTS] [BYTES_PER_WRITE]
 

@@ -233,7 +233,7 @@ protected:
    * put() should be called on destruction of some previously copied pointer.
    * put_unlock() when done with the current pointer (_most common_).
    */  
-  Mutex _lock;
+  mutable Mutex _lock;
   atomic_t ref;
 
 #ifdef PG_DEBUG_REFS
@@ -248,8 +248,8 @@ public:
 
 
   void lock_suspend_timeout(ThreadPool::TPHandle &handle);
-  void lock(bool no_lockdep = false);
-  void unlock() {
+  void lock(bool no_lockdep = false) const;
+  void unlock() const {
     //generic_dout(0) << this << " " << info.pgid << " unlock" << dendl;
     assert(!dirty_info);
     assert(!dirty_big_info);
@@ -357,10 +357,6 @@ public:
       return ret;
     }
 
-    const map<hobject_t, pg_missing_t::item> &get_all_missing() const {
-      return needs_recovery_map;
-    }
-
     void clear() {
       needs_recovery_map.clear();
       missing_loc.clear();
@@ -403,6 +399,11 @@ public:
       const pg_missing_t &omissing, ///< [in] (optional) missing
       ThreadPool::TPHandle* handle  ///< [in] ThreadPool handle
       ); ///< @return whether a new object location was discovered
+
+    /// Adds recovery sources in batch
+    void add_batch_sources_info(
+      const set<pg_shard_t> &sources  ///< [in] a set of resources which can be used for all objects
+      );
 
     /// Uses osdmap to update structures for now down sources
     void check_recovery_sources(const OSDMapRef osdmap);
@@ -2004,7 +2005,7 @@ public:
 
  private:
   // Prevent copying
-  PG(const PG& rhs);
+  explicit PG(const PG& rhs);
   PG& operator=(const PG& rhs);
   const spg_t pg_id;
   uint64_t peer_features;
@@ -2107,10 +2108,11 @@ public:
 		    spg_t pgid, const pg_pool_t *pool);
 
 private:
-  void write_info(ObjectStore::Transaction& t);
+  void prepare_write_info(map<string,bufferlist> *km);
 
 public:
-  static int _write_info(ObjectStore::Transaction& t, epoch_t epoch,
+  static int _prepare_write_info(map<string,bufferlist> *km,
+    epoch_t epoch,
     pg_info_t &info, coll_t coll,
     map<epoch_t,pg_interval_t> &past_intervals,
     ghobject_t &pgmeta_oid,
@@ -2125,7 +2127,7 @@ public:
     return at_version;
   }
 
-  void add_log_entry(const pg_log_entry_t& e, bufferlist& log_bl);
+  void add_log_entry(const pg_log_entry_t& e);
   void append_log(
     const vector<pg_log_entry_t>& logv,
     eversion_t trim_to,

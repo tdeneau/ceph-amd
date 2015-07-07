@@ -166,16 +166,30 @@ public:
 
     object_copy_cursor_t temp_cursor;
 
+    /*
+     * For CopyOp the process is:
+     * step1: read the data(attr/omap/data) from the source object
+     * step2: handle those data(w/ those data create a new object)
+     * src_obj_fadvise_flags used in step1;
+     * dest_obj_fadvise_flags used in step2
+     */
+    unsigned src_obj_fadvise_flags;
+    unsigned dest_obj_fadvise_flags;
+
     CopyOp(CopyCallback *cb_, ObjectContextRef _obc, hobject_t s,
 	   object_locator_t l,
            version_t v,
 	   unsigned f,
-	   bool ms)
+	   bool ms,
+	   unsigned src_obj_fadvise_flags,
+	   unsigned dest_obj_fadvise_flags)
       : cb(cb_), obc(_obc), src(s), oloc(l), flags(f),
 	mirror_snapset(ms),
 	objecter_tid(0),
 	objecter_tid2(0),
-	rval(-1)
+	rval(-1),
+	src_obj_fadvise_flags(src_obj_fadvise_flags),
+	dest_obj_fadvise_flags(dest_obj_fadvise_flags)
     {
       results.user_version = v;
       results.mirror_snapset = mirror_snapset;
@@ -1156,11 +1170,6 @@ protected:
 		      const object_locator_t& oloc,    ///< locator for obc|oid
 		      OpRequestRef op);                ///< [optional] client op
 
-  /**
-   * Check if the op is such that we can skip promote (e.g., DELETE)
-   */
-  bool can_skip_promote(OpRequestRef op);
-
   int prepare_transaction(OpContext *ctx);
   list<pair<OpRequestRef, OpContext*> > in_progress_async_reads;
   void complete_read_ctx(int result, OpContext *ctx);
@@ -1289,11 +1298,11 @@ protected:
    * @param src: The source object
    * @param oloc: the source object locator
    * @param version: the version of the source object to copy (0 for any)
-   * @param temp_dest_oid: the temporary object to use for large objects
    */
   void start_copy(CopyCallback *cb, ObjectContextRef obc, hobject_t src,
 		  object_locator_t oloc, version_t version, unsigned flags,
-		  bool mirror_snapset);
+		  bool mirror_snapset, unsigned src_obj_fadvise_flags,
+		  unsigned dest_obj_fadvise_flags);
   void process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r);
   void _write_copy_chunk(CopyOpRef cop, PGBackend::PGTransaction *t);
   uint64_t get_copy_chunk_size() const {
