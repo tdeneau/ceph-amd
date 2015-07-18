@@ -320,19 +320,31 @@ void MDCache::remove_inode(CInode *o)
   delete o; 
 }
 
+ceph_file_layout MDCache::gen_default_file_layout(const MDSMap &mdsmap)
+{
+  ceph_file_layout result = g_default_file_layout;
+  result.fl_pg_pool = mdsmap.get_first_data_pool();
 
+  return result;
+}
+
+ceph_file_layout MDCache::gen_default_log_layout(const MDSMap &mdsmap)
+{
+  ceph_file_layout result = g_default_file_layout;
+  result.fl_pg_pool = mdsmap.get_metadata_pool();
+  if (g_conf->mds_log_segment_size > 0) {
+    result.fl_object_size = g_conf->mds_log_segment_size;
+    result.fl_stripe_unit = g_conf->mds_log_segment_size;
+  }
+
+  return result;
+}
 
 void MDCache::init_layouts()
 {
-  default_file_layout = g_default_file_layout;
-  default_file_layout.fl_pg_pool = mds->mdsmap->get_first_data_pool();
+  default_file_layout = gen_default_file_layout(*(mds->mdsmap));
+  default_log_layout = gen_default_log_layout(*(mds->mdsmap));
 
-  default_log_layout = g_default_file_layout;
-  default_log_layout.fl_pg_pool = mds->mdsmap->get_metadata_pool();
-  if (g_conf->mds_log_segment_size > 0) {
-    default_log_layout.fl_object_size = g_conf->mds_log_segment_size;
-    default_log_layout.fl_stripe_unit = g_conf->mds_log_segment_size;
-  }
 }
 
 void MDCache::create_unlinked_system_inode(CInode *in, inodeno_t ino,
@@ -629,7 +641,18 @@ void MDCache::populate_mydir()
   if (!mydir->is_complete()) {
     mydir->fetch(new C_MDS_RetryOpenRoot(this));
     return;
-  }    
+  }
+
+  if (mydir->get_version() == 0 && mydir->state_test(CDir::STATE_BADFRAG)) {
+    // A missing dirfrag, we will recreate it.  Before that, we must dirty
+    // it before dirtying any of the strays we create within it.
+    mds->clog->warn() << "fragment " << mydir->dirfrag() << " was unreadable, "
+      "recreating it now";
+    LogSegment *ls = mds->mdlog->get_current_segment();
+    mydir->state_clear(CDir::STATE_BADFRAG);
+    mydir->mark_complete();
+    mydir->mark_dirty(mydir->pre_dirty(), ls);
+  }
 
   // open or create stray
   for (int i = 0; i < NUM_STRAY; ++i) {
@@ -669,15 +692,6 @@ void MDCache::populate_mydir()
 	return;
       }
     }
-  }
-
-  // open or create journal file
-  string jname("journal");
-  CDentry *jdn = mydir->lookup(jname);
-  if (!jdn || !jdn->get_linkage()->get_inode()) {
-    _create_system_file(mydir, jname.c_str(), create_system_inode(MDS_INO_LOG_OFFSET + mds->whoami, S_IFREG),
-			new C_MDS_RetryOpenRoot(this));
-    return;
   }
 
   // okay!
@@ -6397,7 +6411,7 @@ bool MDCache::trim_dentry(CDentry *dn, map<mds_rank_t, MCacheExpire*>& expiremap
   }
 
   // remove dentry
-  if (dir->is_auth())
+  if (dn->last == CEPH_NOSNAP && dir->is_auth())
     dir->add_to_bloom(dn);
   dir->remove_dentry(dn);
 
@@ -7616,6 +7630,12 @@ int MDCache::path_traverse(MDRequestRef& mdr, Message *req, MDSInternalContextBa
   if (cur->state_test(CInode::STATE_PURGING))
     return -ESTALE;
 
+  // make sure snaprealm are open...
+  if (mdr && cur->snaprealm && !cur->snaprealm->is_open() &&
+      !cur->snaprealm->open_parents(_get_waiter(mdr, req, fin))) {
+    return 1;
+  }
+
   // start trace
   if (pdnvec)
     pdnvec->clear();
@@ -7696,13 +7716,6 @@ int MDCache::path_traverse(MDRequestRef& mdr, Message *req, MDSInternalContextBa
     }
     */
 
-    // make sure snaprealm parents are open...
-    if (cur->snaprealm && !cur->snaprealm->open && mdr &&
-	!cur->snaprealm->open_parents(_get_waiter(mdr, req, fin))) {
-      return 1;
-    }
-
-
     // dentry
     CDentry *dn = curdir->lookup(path[depth], snapid);
     CDentry::linkage_t *dnl = dn ? dn->get_projected_linkage() : 0;
@@ -7769,8 +7782,14 @@ int MDCache::path_traverse(MDRequestRef& mdr, Message *req, MDSInternalContextBa
         }        
       }
 
-      // add to trace, continue.
       cur = in;
+      // make sure snaprealm are open...
+      if (mdr && cur->snaprealm && !cur->snaprealm->is_open() &&
+	  !cur->snaprealm->open_parents(_get_waiter(mdr, req, fin))) {
+	return 1;
+      }
+
+      // add to trace, continue.
       touch_inode(cur);
       if (pdnvec)
 	pdnvec->push_back(dn);
@@ -7786,8 +7805,10 @@ int MDCache::path_traverse(MDRequestRef& mdr, Message *req, MDSInternalContextBa
 
     if (curdir->is_auth()) {
       // dentry is mine.
-      if (curdir->is_complete() || (curdir->has_bloom() &&
-          !curdir->is_in_bloom(path[depth]))){
+      if (curdir->is_complete() ||
+	  (snapid == CEPH_NOSNAP &&
+	   curdir->has_bloom() &&
+	   !curdir->is_in_bloom(path[depth]))){
         // file not found
 	if (pdnvec) {
 	  // instantiate a null dn?
@@ -9000,6 +9021,7 @@ void MDCache::do_realm_invalidate_and_update_notify(CInode *in, int snapop, bool
   bufferlist snapbl;
   in->snaprealm->build_snap_trace(snapbl);
 
+  set<SnapRealm*> past_children;
   map<client_t, MClientSnap*> updates;
   list<SnapRealm*> q;
   q.push_back(in->snaprealm);
@@ -9024,6 +9046,13 @@ void MDCache::do_realm_invalidate_and_update_notify(CInode *in, int snapop, bool
       }
     }
 
+    if (snapop == CEPH_SNAP_OP_UPDATE || snapop == CEPH_SNAP_OP_DESTROY) {
+      for (set<SnapRealm*>::iterator p = realm->open_past_children.begin();
+	   p != realm->open_past_children.end();
+	   ++p)
+	past_children.insert(*p);
+    }
+
     // notify for active children, too.
     dout(10) << " " << realm << " open_children are " << realm->open_children << dendl;
     for (set<SnapRealm*>::iterator p = realm->open_children.begin();
@@ -9034,6 +9063,43 @@ void MDCache::do_realm_invalidate_and_update_notify(CInode *in, int snapop, bool
 
   if (!nosend)
     send_snaps(updates);
+
+  // notify past children and their descendants if we update/delete old snapshots
+  for (set<SnapRealm*>::iterator p = past_children.begin();
+       p !=  past_children.end();
+       ++p)
+    q.push_back(*p);
+
+  while (!q.empty()) {
+    SnapRealm *realm = q.front();
+    q.pop_front();
+
+    realm->invalidate_cached_snaps();
+
+    for (set<SnapRealm*>::iterator p = realm->open_children.begin();
+	 p != realm->open_children.end();
+	 ++p) {
+      if (past_children.count(*p) == 0)
+	q.push_back(*p);
+    }
+
+    for (set<SnapRealm*>::iterator p = realm->open_past_children.begin();
+	 p != realm->open_past_children.end();
+	 ++p) {
+      if (past_children.count(*p) == 0) {
+	q.push_back(*p);
+	past_children.insert(*p);
+      }
+    }
+  }
+
+  if (snapop == CEPH_SNAP_OP_DESTROY) {
+    // eval stray inodes if we delete snapshot from their past ancestor snaprealm
+    for (set<SnapRealm*>::iterator p = past_children.begin();
+	p != past_children.end();
+	++p)
+      maybe_eval_stray((*p)->inode, true);
+  }
 }
 
 void MDCache::_snaprealm_create_finish(MDRequestRef& mdr, MutationRef& mut, CInode *in)
@@ -9055,9 +9121,10 @@ void MDCache::_snaprealm_create_finish(MDRequestRef& mdr, MutationRef& mut, CIno
   ::decode(seq, p);
 
   in->open_snaprealm();
-  in->snaprealm->open = true;
   in->snaprealm->srnode.seq = seq;
   in->snaprealm->srnode.created = seq;
+  bool ok = in->snaprealm->_open_parents(NULL);
+  assert(ok);
 
   do_realm_invalidate_and_update_notify(in, CEPH_SNAP_OP_SPLIT);
 
@@ -9123,7 +9190,7 @@ void MDCache::scan_stray_dir(dirfrag_t next)
 void MDCache::eval_remote(CDentry *remote_dn)
 {
   assert(remote_dn);
-  dout(10) << "eval_remote " << *remote_dn << dendl;
+  dout(10) << __func__ << " " << *remote_dn << dendl;
 
   CDentry::linkage_t *dnl = remote_dn->get_projected_linkage();
   assert(dnl->is_remote());
@@ -9131,6 +9198,11 @@ void MDCache::eval_remote(CDentry *remote_dn)
 
   if (!in) {
     dout(20) << __func__ << ": no inode, cannot evaluate" << dendl;
+    return;
+  }
+
+  if (remote_dn->last != CEPH_NOSNAP) {
+    dout(20) << __func__ << ": snap dentry, cannot evaluate" << dendl;
     return;
   }
 

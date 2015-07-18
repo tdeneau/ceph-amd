@@ -45,7 +45,8 @@ int TestMemIoCtxImpl::aio_remove(const std::string& oid, AioCompletionImpl *c) {
 
 int TestMemIoCtxImpl::assert_exists(const std::string &oid) {
   RWLock::RLocker l(m_pool->file_lock);
-  TestMemRadosClient::SharedFile file = get_file(oid, false);
+  TestMemRadosClient::SharedFile file = get_file(oid, false,
+                                                 get_snap_context());
   if (file == NULL) {
     return -ENOENT;
   }
@@ -58,7 +59,7 @@ int TestMemIoCtxImpl::create(const std::string& oid, bool exclusive) {
   }
 
   RWLock::WLocker l(m_pool->file_lock);
-  get_file(oid, true);
+  get_file(oid, true, get_snap_context());
   return 0;
 }
 
@@ -140,7 +141,7 @@ int TestMemIoCtxImpl::omap_get_vals(const std::string& oid,
   TestMemRadosClient::SharedFile file;
   {
     RWLock::RLocker l(m_pool->file_lock);
-    file = get_file(oid, false);
+    file = get_file(oid, false, get_snap_context());
     if (file == NULL) {
       return -ENOENT;
     }
@@ -180,7 +181,7 @@ int TestMemIoCtxImpl::omap_rm_keys(const std::string& oid,
   TestMemRadosClient::SharedFile file;
   {
     RWLock::WLocker l(m_pool->file_lock);
-    file = get_file(oid, true);
+    file = get_file(oid, true, get_snap_context());
     if (file == NULL) {
       return -ENOENT;
     }
@@ -203,7 +204,7 @@ int TestMemIoCtxImpl::omap_set(const std::string& oid,
   TestMemRadosClient::SharedFile file;
   {
     RWLock::WLocker l(m_pool->file_lock);
-    file = get_file(oid, true);
+    file = get_file(oid, true, get_snap_context());
     if (file == NULL) {
       return -ENOENT;
     }
@@ -225,7 +226,7 @@ int TestMemIoCtxImpl::read(const std::string& oid, size_t len, uint64_t off,
   TestMemRadosClient::SharedFile file;
   {
     RWLock::RLocker l(m_pool->file_lock);
-    file = get_file(oid, false);
+    file = get_file(oid, false, get_snap_context());
     if (file == NULL) {
       return -ENOENT;
     }
@@ -241,7 +242,7 @@ int TestMemIoCtxImpl::read(const std::string& oid, size_t len, uint64_t off,
     bit.substr_of(file->data, off, len);
     append_clone(bit, bl);
   }
-  return 0;
+  return len;
 }
 
 int TestMemIoCtxImpl::remove(const std::string& oid) {
@@ -250,11 +251,12 @@ int TestMemIoCtxImpl::remove(const std::string& oid) {
   }
 
   RWLock::WLocker l(m_pool->file_lock);
-  TestMemRadosClient::SharedFile file = get_file(oid, false);
+  TestMemRadosClient::SharedFile file = get_file(oid, false,
+                                                 get_snap_context());
   if (file == NULL) {
     return -ENOENT;
   }
-  file = get_file(oid, true);
+  file = get_file(oid, true, get_snap_context());
 
   RWLock::WLocker l2(file->lock);
   file->exists = false;
@@ -340,7 +342,7 @@ int TestMemIoCtxImpl::sparse_read(const std::string& oid, uint64_t off,
   TestMemRadosClient::SharedFile file;
   {
     RWLock::RLocker l(m_pool->file_lock);
-    file = get_file(oid, false);
+    file = get_file(oid, false, get_snap_context());
     if (file == NULL) {
       return -ENOENT;
     }
@@ -367,7 +369,7 @@ int TestMemIoCtxImpl::stat(const std::string& oid, uint64_t *psize,
   TestMemRadosClient::SharedFile file;
   {
     RWLock::RLocker l(m_pool->file_lock);
-    file = get_file(oid, false);
+    file = get_file(oid, false, get_snap_context());
     if (file == NULL) {
       return -ENOENT;
     }
@@ -383,7 +385,8 @@ int TestMemIoCtxImpl::stat(const std::string& oid, uint64_t *psize,
   return 0;
 }
 
-int TestMemIoCtxImpl::truncate(const std::string& oid, uint64_t size) {
+int TestMemIoCtxImpl::truncate(const std::string& oid, uint64_t size,
+                               const SnapContext &snapc) {
   if (get_snap_read() != CEPH_NOSNAP) {
     return -EROFS;
   }
@@ -391,7 +394,7 @@ int TestMemIoCtxImpl::truncate(const std::string& oid, uint64_t size) {
   TestMemRadosClient::SharedFile file;
   {
     RWLock::WLocker l(m_pool->file_lock);
-    file = get_file(oid, true);
+    file = get_file(oid, true, snapc);
   }
 
   RWLock::WLocker l(file->lock);
@@ -419,7 +422,7 @@ int TestMemIoCtxImpl::truncate(const std::string& oid, uint64_t size) {
 }
 
 int TestMemIoCtxImpl::write(const std::string& oid, bufferlist& bl, size_t len,
-                            uint64_t off) {
+                            uint64_t off, const SnapContext &snapc) {
   if (get_snap_read() != CEPH_NOSNAP) {
     return -EROFS;
   }
@@ -427,7 +430,7 @@ int TestMemIoCtxImpl::write(const std::string& oid, bufferlist& bl, size_t len,
   TestMemRadosClient::SharedFile file;
   {
     RWLock::WLocker l(m_pool->file_lock);
-    file = get_file(oid, true);
+    file = get_file(oid, true, snapc);
   }
 
   RWLock::WLocker l(file->lock);
@@ -443,7 +446,8 @@ int TestMemIoCtxImpl::write(const std::string& oid, bufferlist& bl, size_t len,
   return 0;
 }
 
-int TestMemIoCtxImpl::write_full(const std::string& oid, bufferlist& bl) {
+int TestMemIoCtxImpl::write_full(const std::string& oid, bufferlist& bl,
+                                 const SnapContext &snapc) {
   if (get_snap_read() != CEPH_NOSNAP) {
     return -EROFS;
   }
@@ -451,7 +455,7 @@ int TestMemIoCtxImpl::write_full(const std::string& oid, bufferlist& bl) {
   TestMemRadosClient::SharedFile file;
   {
     RWLock::WLocker l(m_pool->file_lock);
-    file = get_file(oid, true);
+    file = get_file(oid, true, snapc);
     if (file == NULL) {
       return -ENOENT;
     }
@@ -494,11 +498,11 @@ int TestMemIoCtxImpl::zero(const std::string& oid, uint64_t off, uint64_t len) {
   TestMemRadosClient::SharedFile file;
   {
     RWLock::WLocker l(m_pool->file_lock);
-    file = get_file(oid, false);
+    file = get_file(oid, false, get_snap_context());
     if (!file) {
       return 0;
     }
-    file = get_file(oid, true);
+    file = get_file(oid, true, get_snap_context());
 
     RWLock::RLocker l2(file->lock);
     if (len > 0 && off + len >= file->data.length()) {
@@ -507,12 +511,12 @@ int TestMemIoCtxImpl::zero(const std::string& oid, uint64_t off, uint64_t len) {
     }
   }
   if (truncate_redirect) {
-    return truncate(oid, off);
+    return truncate(oid, off, get_snap_context());
   }
 
   bufferlist bl;
   bl.append_zero(len);
-  return write(oid, bl, len, off);
+  return write(oid, bl, len, off, get_snap_context());
 }
 
 void TestMemIoCtxImpl::append_clone(bufferlist& src, bufferlist* dest) {
@@ -544,7 +548,7 @@ void TestMemIoCtxImpl::ensure_minimum_length(size_t len, bufferlist *bl) {
 }
 
 TestMemRadosClient::SharedFile TestMemIoCtxImpl::get_file(
-    const std::string &oid, bool write) {
+    const std::string &oid, bool write, const SnapContext &snapc) {
   assert(m_pool->file_lock.is_locked() || m_pool->file_lock.is_wlocked());
   assert(!write || m_pool->file_lock.is_wlocked());
 
@@ -557,7 +561,6 @@ TestMemRadosClient::SharedFile TestMemIoCtxImpl::get_file(
   }
 
   if (write) {
-    const SnapContext &snapc = get_snap_context();
     bool new_version = false;
     if (!file || !file->exists) {
       file = TestMemRadosClient::SharedFile(new TestMemRadosClient::File());
@@ -572,11 +575,13 @@ TestMemRadosClient::SharedFile TestMemIoCtxImpl::get_file(
           }
         }
 
-        uint64_t prev_size = file->data.length();
+        bufferlist prev_data = file->data;
         file = TestMemRadosClient::SharedFile(
           new TestMemRadosClient::File(*file));
-        if (prev_size > 0) {
-          file->snap_overlap.insert(0, prev_size);
+        file->data.clear();
+        append_clone(prev_data, &file->data);
+        if (prev_data.length() > 0) {
+          file->snap_overlap.insert(0, prev_data.length());
         }
         new_version = true;
       }

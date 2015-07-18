@@ -19,8 +19,16 @@ source test/test_btrfs_common.sh
 
 PS4='${FUNCNAME[0]}: $LINENO: '
 
-export PATH=:$PATH # make sure program from sources are prefered
+export PATH=.:$PATH # make sure program from sources are prefered
 DIR=test-ceph-disk
+virtualenv virtualenv-$DIR
+. virtualenv-$DIR/bin/activate
+(
+    if test -d ceph-detect-init/wheelhouse ; then
+        wheelhouse="--no-index --use-wheel --find-links=ceph-detect-init/wheelhouse"
+    fi
+    pip --log virtualenv-$DIR/log.txt install $wheelhouse --editable ceph-detect-init
+)
 OSD_DATA=$DIR/osd
 MON_ID=a
 MONA=127.0.0.1:7451
@@ -172,6 +180,55 @@ function test_no_path() {
     ( unset PATH ; test_activate_dir ) || return 1
 }
 
+function test_mark_init() {
+    run_mon
+
+    local osd_data=$(pwd)/$DIR/dir
+    $mkdir -p $osd_data
+
+    local osd_uuid=$($uuidgen)
+
+    $mkdir -p $OSD_DATA
+
+    ./ceph-disk $CEPH_DISK_ARGS \
+        prepare --osd-uuid $osd_uuid $osd_data || return 1
+
+    $timeout $TIMEOUT ./ceph-disk $CEPH_DISK_ARGS \
+        --verbose \
+        activate \
+        --mark-init=auto \
+        --no-start-daemon \
+        $osd_data || return 1
+
+    test -f $osd_data/$(ceph-detect-init) || return 1
+
+    if test systemd = $(ceph-detect-init) ; then
+        expected=sysvinit
+    else
+        expected=systemd
+    fi
+    $timeout $TIMEOUT ./ceph-disk $CEPH_DISK_ARGS \
+        --verbose \
+        activate \
+        --mark-init=$expected \
+        --no-start-daemon \
+        $osd_data || return 1
+
+    ! test -f $osd_data/$(ceph-detect-init) || return 1
+    test -f $osd_data/$expected || return 1
+
+    $rm -fr $osd_data
+}
+
+function test_zap() {
+    local osd_data=$DIR/dir
+    $mkdir -p $osd_data
+
+    ./ceph-disk $CEPH_DISK_ARGS zap $osd_data 2>&1 | grep -q 'not full block device' || return 1
+
+    $rm -fr $osd_data
+}
+
 # ceph-disk prepare returns immediately on success if the magic file
 # exists in the --osd-data directory.
 function test_activate_dir_magic() {
@@ -267,7 +324,7 @@ function test_activate_dmcrypt() {
         --mark-init=none \
         /dev/mapper/$uuid || return 1
 
-    test_pool_read_write $osd_uuid || return 1
+    test_pool_read_write $uuid || return 1
 }
 
 function test_activate_dir() {
@@ -371,7 +428,9 @@ function reset_leftover_dev() {
     local path=$1
 
     losetup --all | sed -e 's/://' | while read dev id associated_path ; do
-        if test $associated_path = "($path)" ; then
+        # if $path has been deleted with a dev attached, then $associated_path
+        # will carry "($path (deleted))".
+        if test "$associated_path" = "($path)" ; then
             reset_dev $dev
             losetup --detach $dev
         fi
@@ -562,14 +621,23 @@ function run() {
     default_actions+="test_activate_dir_magic "
     default_actions+="test_activate_dir "
     default_actions+="test_keyring_path "
+    default_actions+="test_mark_init "
+    default_actions+="test_zap "
     local actions=${@:-$default_actions}
+    local status
     for action in $actions  ; do
         setup
+        set -x
         $action
         status=$?
+        set +x
         teardown
-        test $status != 0 || return $status
+        if test $status != 0 ; then
+            break
+        fi
     done
+    rm -fr virtualenv-$DIR
+    return $status
 }
 
 run $@

@@ -13,6 +13,7 @@
  */
 
 #include "include/int_types.h"
+#include "common/errno.h"
 
 #include <string>
 #include <stdio.h>
@@ -442,20 +443,11 @@ void CInode::pop_projected_snaprealm(sr_t *next_snaprealm)
   } else if (next_snaprealm->past_parents.size() !=
 	     snaprealm->srnode.past_parents.size()) {
     invalidate_cached_snaps = true;
+    // re-open past parents
+    snaprealm->_close_parents();
 
-    // update parent pointer
-    assert(snaprealm->open);
-    assert(snaprealm->parent);   // had a parent before
-    SnapRealm *new_parent = get_parent_inode()->find_snaprealm();
-    assert(new_parent);
-    CInode *parenti = new_parent->inode;
-    assert(parenti);
-    assert(parenti->snaprealm);
-    snaprealm->parent = new_parent;
-    snaprealm->add_open_past_parent(new_parent);
     dout(10) << " realm " << *snaprealm << " past_parents " << snaprealm->srnode.past_parents
 	     << " -> " << next_snaprealm->past_parents << dendl;
-    dout(10) << " pinning new parent " << *parenti << dendl;
   }
   snaprealm->srnode = *next_snaprealm;
   delete next_snaprealm;
@@ -857,9 +849,10 @@ void CInode::name_stray_dentry(string& dname)
 
 version_t CInode::pre_dirty()
 {
-  version_t pv; 
-  if (parent || !projected_parent.empty()) {
-    pv = get_projected_parent_dn()->pre_dirty(get_projected_version());
+  version_t pv;
+  CDentry* _cdentry = get_projected_parent_dn(); 
+  if (_cdentry) {
+    pv = _cdentry->pre_dirty(get_projected_version());
     dout(10) << "pre_dirty " << pv << " (current v " << inode.version << ")" << dendl;
   } else {
     assert(is_base());
@@ -1023,6 +1016,7 @@ struct C_IO_Inode_Fetched : public CInodeIOContext {
   Context *fin;
   C_IO_Inode_Fetched(CInode *i, Context *f) : CInodeIOContext(i), fin(f) {}
   void finish(int r) {
+    // Ignore 'r', because we fetch from two places, so r is usually ENOENT
     in->_fetched(bl, bl2, fin);
   }
 };
@@ -1037,12 +1031,12 @@ void CInode::fetch(MDSInternalContextBase *fin)
   object_t oid = CInode::get_object_name(ino(), frag_t(), "");
   object_locator_t oloc(mdcache->mds->mdsmap->get_metadata_pool());
 
+  // Old on-disk format: inode stored in xattr of a dirfrag
   ObjectOperation rd;
   rd.getxattr("inode", &c->bl, NULL);
-
   mdcache->mds->objecter->read(oid, oloc, rd, CEPH_NOSNAP, (bufferlist*)NULL, 0, gather.new_sub());
 
-  // read from separate object too
+  // Current on-disk format: inode stored in a .inode object
   object_t oid2 = CInode::get_object_name(ino(), frag_t(), ".inode");
   mdcache->mds->objecter->read(oid2, oloc, 0, 0, CEPH_NOSNAP, &c->bl2, 0, gather.new_sub());
 
@@ -1053,10 +1047,16 @@ void CInode::_fetched(bufferlist& bl, bufferlist& bl2, Context *fin)
 {
   dout(10) << "_fetched got " << bl.length() << " and " << bl2.length() << dendl;
   bufferlist::iterator p;
-  if (bl2.length())
+  if (bl2.length()) {
     p = bl2.begin();
-  else
+  } else if (bl.length()) {
     p = bl.begin();
+  } else {
+    derr << "No data while reading inode 0x" << std::hex << ino()
+      << std::dec << dendl;
+    fin->complete(-ENOENT);
+    return;
+  }
   string magic;
   ::decode(magic, p);
   dout(10) << " magic is '" << magic << "' (expecting '" << CEPH_FS_ONDISK_MAGIC << "')" << dendl;
@@ -1065,7 +1065,14 @@ void CInode::_fetched(bufferlist& bl, bufferlist& bl2, Context *fin)
 	    << "'" << dendl;
     fin->complete(-EINVAL);
   } else {
-    decode_store(p);
+    try {
+      decode_store(p);
+    } catch (buffer::error &err) {
+      derr << "Corrupt inode 0x" << std::hex << ino() << std::dec
+        << ": " << err << dendl;
+      fin->complete(-EINVAL);
+      return;
+    }
     dout(10) << "_fetched " << *this << dendl;
     fin->complete(0);
   }

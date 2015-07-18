@@ -1237,7 +1237,13 @@ class RGWRados
   void cls_obj_check_prefix_exist(librados::ObjectOperation& op, const string& prefix, bool fail_if_exist);
 protected:
   CephContext *cct;
-  librados::Rados *rados;
+
+  librados::Rados **rados;
+  atomic_t next_rados_handle;
+  uint32_t num_rados_handles;
+  RWLock handle_lock;
+  std::map<pthread_t, int> rados_map;
+
   librados::IoCtx gc_pool_ctx;        // .rgw.gc
 
   bool pools_initialized;
@@ -1256,8 +1262,9 @@ public:
                watch_initialized(false),
                bucket_id_lock("rados_bucket_id"),
                bucket_index_max_shards(0),
-               max_bucket_id(0),
-               cct(NULL), rados(NULL),
+               max_bucket_id(0), cct(NULL),
+               rados(NULL), next_rados_handle(0),
+               num_rados_handles(0), handle_lock("rados_handle_lock"),
                pools_initialized(false),
                quota_handler(NULL),
                finisher(NULL),
@@ -1293,9 +1300,14 @@ public:
   RGWDataChangesLog *data_log;
 
   virtual ~RGWRados() {
+    for (uint32_t i=0; i < num_rados_handles; i++) {
+      if (rados[i]) {
+        rados[i]->shutdown();
+        delete rados[i];
+      }
+    }
     if (rados) {
-      rados->shutdown();
-      delete rados;
+      delete[] rados;
     }
   }
 
@@ -2032,7 +2044,12 @@ public:
                          map<RGWObjCategory, RGWStorageStats> *calculated_stats);
   int bucket_rebuild_index(rgw_bucket& bucket);
   int remove_objs_from_index(rgw_bucket& bucket, list<rgw_obj_key>& oid_list);
+  int move_rados_obj(librados::IoCtx& src_ioctx,
+		     const string& src_oid, const string& src_locator,
+	             librados::IoCtx& dst_ioctx,
+		     const string& dst_oid, const string& dst_locator);
   int fix_head_obj_locator(rgw_bucket& bucket, bool copy_obj, bool remove_bad, rgw_obj_key& key);
+  int fix_tail_obj_locator(rgw_bucket& bucket, rgw_obj_key& key, bool fix, bool *need_fix);
 
   int cls_user_get_header(const string& user_id, cls_user_header *header);
   int cls_user_get_header_async(const string& user_id, RGWGetUserHeader_CB *ctx);
@@ -2144,6 +2161,8 @@ public:
 
   uint64_t instance_id();
   uint64_t next_bucket_id();
+
+  librados::Rados* get_rados_handle();
 };
 
 class RGWStoreManager {

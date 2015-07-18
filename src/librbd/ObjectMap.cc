@@ -429,6 +429,7 @@ void ObjectMap::aio_resize(uint64_t new_size, uint8_t default_object_state,
 			   Context *on_finish) {
   assert(m_image_ctx.test_features(RBD_FEATURE_OBJECT_MAP));
   assert(m_image_ctx.owner_lock.is_locked());
+  assert(m_image_ctx.image_watcher != NULL);
   assert(!m_image_ctx.image_watcher->is_lock_supported() ||
          m_image_ctx.image_watcher->is_lock_owner());
 
@@ -450,9 +451,11 @@ bool ObjectMap::aio_update(uint64_t start_object_no, uint64_t end_object_no,
                            const boost::optional<uint8_t> &current_state,
                            Context *on_finish)
 {
-  assert(m_image_ctx.test_features(RBD_FEATURE_OBJECT_MAP));
+  assert(m_image_ctx.snap_lock.is_locked());
+  assert((m_image_ctx.features & RBD_FEATURE_OBJECT_MAP) != 0);
   assert(m_image_ctx.owner_lock.is_locked());
-  assert(!m_image_ctx.image_watcher->is_lock_supported() ||
+  assert(m_image_ctx.image_watcher != NULL);
+  assert(!m_image_ctx.image_watcher->is_lock_supported(m_image_ctx.snap_lock) ||
          m_image_ctx.image_watcher->is_lock_owner());
   assert(m_image_ctx.object_map_lock.is_wlocked());
   assert(start_object_no < end_object_no);
@@ -474,15 +477,23 @@ bool ObjectMap::aio_update(uint64_t start_object_no, uint64_t end_object_no,
     if ((!current_state || state == *current_state ||
           (*current_state == OBJECT_EXISTS && state == OBJECT_EXISTS_CLEAN)) &&
         state != new_state) {
-      UpdateRequest *req = new UpdateRequest(m_image_ctx, m_snap_id,
-                                             start_object_no, end_object_no,
-                                             new_state, current_state,
-                                             on_finish);
-      req->send();
+      aio_update(m_snap_id, start_object_no, end_object_no, new_state,
+                 current_state, on_finish);
       return true;
     }
   }
   return false;
+}
+
+void ObjectMap::aio_update(uint64_t snap_id, uint64_t start_object_no,
+                           uint64_t end_object_no, uint8_t new_state,
+                           const boost::optional<uint8_t> &current_state,
+                           Context *on_finish) {
+  UpdateRequest *req = new UpdateRequest(m_image_ctx, snap_id,
+                                         start_object_no, end_object_no,
+                                         new_state, current_state,
+                                         on_finish);
+  req->send();
 }
 
 void ObjectMap::invalidate(uint64_t snap_id) {
@@ -508,11 +519,24 @@ void ObjectMap::invalidate(uint64_t snap_id) {
     return;
   }
 
+  // do not update on-disk flags if not image owner
+  if (m_image_ctx.image_watcher == NULL ||
+      (m_image_ctx.image_watcher->is_lock_supported(m_image_ctx.snap_lock) &&
+       !m_image_ctx.image_watcher->is_lock_owner())) {
+    return;
+  }
+
   librados::ObjectWriteOperation op;
+  if (snap_id == CEPH_NOSNAP) {
+    m_image_ctx.image_watcher->assert_header_locked(&op);
+  }
   cls_client::set_flags(&op, snap_id, flags, flags);
 
   r = m_image_ctx.md_ctx.operate(m_image_ctx.header_oid, &op);
-  if (r < 0) {
+  if (r == -EBUSY) {
+    ldout(cct, 5) << "skipping on-disk object map invalidation: "
+                  << "image not locked by client" << dendl;
+  } else if (r < 0) {
     lderr(cct) << "failed to invalidate on-disk object map: " << cpp_strerror(r)
 	       << dendl;
   }
@@ -586,6 +610,7 @@ bool ObjectMap::Request::invalidate() {
   m_image_ctx.flags |= flags;
 
   librados::ObjectWriteOperation op;
+  m_image_ctx.image_watcher->assert_header_locked(&op);
   cls_client::set_flags(&op, CEPH_NOSNAP, flags, flags);
 
   librados::AioCompletion *rados_completion = create_callback_completion();
@@ -627,25 +652,32 @@ void ObjectMap::ResizeRequest::finish(ObjectMap *object_map) {
 }
 
 void ObjectMap::UpdateRequest::send() {
-  assert(m_image_ctx.object_map_lock.is_wlocked());
+  assert(m_image_ctx.object_map_lock.is_locked());
   CephContext *cct = m_image_ctx.cct;
 
   // safe to update in-memory state first without handling rollback since any
   // failures will invalidate the object map
-  ldout(cct, 20) << &m_image_ctx << " updating object map: ["
+  ldout(cct, 20) << &m_image_ctx << " updating object map"
+                 << (m_snap_id != CEPH_NOSNAP ?
+                       " snap " + stringify(m_snap_id) : std::string())
+                 << ": ["
 		 << m_start_object_no << "," << m_end_object_no << ") = "
 		 << (m_current_state ?
 		       stringify(static_cast<uint32_t>(*m_current_state)) : "")
 		 << "->" << static_cast<uint32_t>(m_new_state)
 		 << dendl;
+
   ObjectMap& object_map = m_image_ctx.object_map;
-  for (uint64_t object_no = m_start_object_no;
-       object_no < MIN(m_end_object_no, object_map.m_object_map.size());
-       ++object_no) {
-    uint8_t state = object_map.m_object_map[object_no];
-    if (!m_current_state || state == *m_current_state ||
+  if (m_snap_id == object_map.m_snap_id) {
+    assert(m_image_ctx.object_map_lock.is_wlocked());
+    for (uint64_t object_no = m_start_object_no;
+         object_no < MIN(m_end_object_no, object_map.m_object_map.size());
+         ++object_no) {
+      uint8_t state = object_map.m_object_map[object_no];
+      if (!m_current_state || state == *m_current_state ||
           (*m_current_state == OBJECT_EXISTS && state == OBJECT_EXISTS_CLEAN)) {
-      object_map.m_object_map[object_no] = m_new_state;
+        object_map.m_object_map[object_no] = m_new_state;
+      }
     }
   }
 

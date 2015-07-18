@@ -34,6 +34,7 @@
 #include <sys/uio.h>
 #include <limits.h>
 
+#include <ostream>
 namespace ceph {
 
 #ifdef BUFFER_DEBUG
@@ -45,8 +46,8 @@ static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
 # define bendl std::endl; }
 #endif
 
-  atomic_t buffer_total_alloc;
-  bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
+  static atomic_t buffer_total_alloc;
+  const bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
 
   void buffer::inc_total_alloc(unsigned len) {
     if (buffer_track_alloc)
@@ -60,9 +61,9 @@ static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
     return buffer_total_alloc.read();
   }
 
-  atomic_t buffer_cached_crc;
-  atomic_t buffer_cached_crc_adjusted;
-  bool buffer_track_crc = get_env_bool("CEPH_BUFFER_TRACK");
+  static atomic_t buffer_cached_crc;
+  static atomic_t buffer_cached_crc_adjusted;
+  static bool buffer_track_crc = get_env_bool("CEPH_BUFFER_TRACK");
 
   void buffer::track_cached_crc(bool b) {
     buffer_track_crc = b;
@@ -74,8 +75,8 @@ static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
     return buffer_cached_crc_adjusted.read();
   }
 
-  atomic_t buffer_c_str_accesses;
-  bool buffer_track_c_str = get_env_bool("CEPH_BUFFER_TRACK");
+  static atomic_t buffer_c_str_accesses;
+  static bool buffer_track_c_str = get_env_bool("CEPH_BUFFER_TRACK");
 
   void buffer::track_c_str(bool b) {
     buffer_track_c_str = b;
@@ -84,7 +85,7 @@ static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
     return buffer_c_str_accesses.read();
   }
 
-  atomic_t buffer_max_pipe_size;
+  static atomic_t buffer_max_pipe_size;
   int update_max_pipe_size() {
 #ifdef CEPH_HAVE_SETPIPE_SZ
     char buf[32];
@@ -1917,5 +1918,34 @@ std::ostream& operator<<(std::ostream& out, const buffer::raw &r) {
   return out << "buffer::raw(" << (void*)r.data << " len " << r.len << " nref " << r.nref.read() << ")";
 }
 
+std::ostream& operator<<(std::ostream& out, const buffer::ptr& bp) {
+  if (bp.have_raw())
+    out << "buffer::ptr(" << bp.offset() << "~" << bp.length()
+	<< " " << (void*)bp.c_str()
+	<< " in raw " << (void*)bp.raw_c_str()
+	<< " len " << bp.raw_length()
+	<< " nref " << bp.raw_nref() << ")";
+  else
+    out << "buffer:ptr(" << bp.offset() << "~" << bp.length() << " no raw)";
+  return out;
+}
+
+std::ostream& operator<<(std::ostream& out, const buffer::list& bl) {
+  out << "buffer::list(len=" << bl.length() << "," << std::endl;
+
+  std::list<buffer::ptr>::const_iterator it = bl.buffers().begin();
+  while (it != bl.buffers().end()) {
+    out << "\t" << *it;
+    if (++it == bl.buffers().end()) break;
+    out << "," << std::endl;
+  }
+  out << std::endl << ")";
+  return out;
+}
+
+std::ostream& operator<<(std::ostream& out, buffer::error& e)
+{
+  return out << e.what();
+}
 
 }

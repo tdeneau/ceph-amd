@@ -909,7 +909,7 @@ struct req_info {
   RGWHTTPArgs args;
   map<string, string> x_meta_map;
 
-  const char *host;
+  string host;
   const char *method;
   string script_uri;
   string request_uri;
@@ -1234,7 +1234,7 @@ public:
      * having object locator at all for most objects but the ones that started with underscore as
      * these were escaped.
      */
-    if (orig_obj[0] == '_') {
+    if (orig_obj[0] == '_' && ns.empty()) {
       loc = orig_obj;
     }
   }

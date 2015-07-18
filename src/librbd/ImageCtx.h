@@ -16,6 +16,7 @@
 #include "common/Readahead.h"
 #include "common/RWLock.h"
 #include "common/snap_types.h"
+#include "common/WorkQueue.h"
 #include "include/atomic.h"
 #include "include/buffer.h"
 #include "include/rbd/librbd.hpp"
@@ -130,8 +131,12 @@ namespace librbd {
 
     xlist<AsyncResizeRequest*> async_resize_reqs;
 
+    ContextWQ *aio_work_queue;
+    ContextWQ *op_work_queue;
+
     // Configuration
     static const string METADATA_CONF_PREFIX;
+    bool non_blocking_aio;
     bool cache;
     bool cache_writethrough_until_flush;
     uint64_t cache_size;
@@ -205,6 +210,7 @@ namespace librbd {
     uint64_t get_parent_snap_id(librados::snap_t in_snap_id) const;
     int get_parent_overlap(librados::snap_t in_snap_id,
 			   uint64_t *overlap) const;
+    uint64_t get_copyup_snap_id() const;
     void aio_read_from_cache(object_t o, uint64_t object_no, bufferlist *bl,
 			     size_t len, uint64_t off, Context *onfinish,
 			     int fadvise_flags);
@@ -213,15 +219,13 @@ namespace librbd {
     void user_flushed();
     void flush_cache_aio(Context *onfinish);
     int flush_cache();
-    void shutdown_cache();
+    int shutdown_cache();
     int invalidate_cache(bool purge_on_error=false);
     void invalidate_cache(Context *on_finish);
     void invalidate_cache_completion(int r, Context *on_finish);
     void clear_nonexistence_cache();
     int register_watch();
     void unregister_watch();
-    size_t parent_io_len(uint64_t offset, size_t length,
-			 librados::snap_t in_snap_id);
     uint64_t prune_parent_extents(vector<pair<uint64_t,uint64_t> >& objectx,
 				  uint64_t overlap);
 

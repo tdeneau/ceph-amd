@@ -69,9 +69,10 @@ int diff_object_map(ImageCtx* ictx, uint64_t from_snap_id, uint64_t to_snap_id,
   assert(ictx->snap_lock.is_locked());
   CephContext* cct = ictx->cct;
 
+  bool diff_from_start = (from_snap_id == 0);
   if (from_snap_id == 0) {
     if (!ictx->snaps.empty()) {
-      from_snap_id = ictx->snaps.front();
+      from_snap_id = ictx->snaps.back();
     } else {
       from_snap_id = CEPH_NOSNAP;
     }
@@ -82,6 +83,7 @@ int diff_object_map(ImageCtx* ictx, uint64_t from_snap_id, uint64_t to_snap_id,
   uint64_t current_snap_id = from_snap_id;
   uint64_t next_snap_id = to_snap_id;
   BitVector<2> prev_object_map;
+  bool prev_object_map_valid = false;
   while (true) {
     uint64_t current_size = ictx->size;
     if (current_snap_id != CEPH_NOSNAP) {
@@ -130,21 +132,28 @@ int diff_object_map(ImageCtx* ictx, uint64_t from_snap_id, uint64_t to_snap_id,
 
     uint64_t overlap = MIN(object_map.size(), prev_object_map.size());
     for (uint64_t i = 0; i < overlap; ++i) {
+      ldout(cct, 20) << __func__ << ": object state: " << i << " "
+                     << static_cast<uint32_t>(prev_object_map[i])
+                     << "->" << static_cast<uint32_t>(object_map[i]) << dendl;
       if (object_map[i] == OBJECT_NONEXISTENT) {
         if (prev_object_map[i] != OBJECT_NONEXISTENT) {
           (*object_diff_state)[i] = OBJECT_DIFF_STATE_HOLE;
         }
-      } else if (prev_object_map[i] != object_map[i] &&
-                 !(prev_object_map[i] == OBJECT_EXISTS &&
-                   object_map[i] == OBJECT_EXISTS_CLEAN)) {
+      } else if (object_map[i] == OBJECT_EXISTS ||
+                 (prev_object_map[i] != object_map[i] &&
+                  !(prev_object_map[i] == OBJECT_EXISTS &&
+                    object_map[i] == OBJECT_EXISTS_CLEAN))) {
         (*object_diff_state)[i] = OBJECT_DIFF_STATE_UPDATED;
       }
     }
     ldout(cct, 20) << "diff_object_map: computed overlap diffs" << dendl;
 
     object_diff_state->resize(object_map.size());
-    if (object_map.size() > prev_object_map.size()) {
+    if (object_map.size() > prev_object_map.size() &&
+        (diff_from_start || prev_object_map_valid)) {
       for (uint64_t i = overlap; i < object_diff_state->size(); ++i) {
+        ldout(cct, 20) << __func__ << ": object state: " << i << " "
+                       << "->" << static_cast<uint32_t>(object_map[i]) << dendl;
         if (object_map[i] == OBJECT_NONEXISTENT) {
           (*object_diff_state)[i] = OBJECT_DIFF_STATE_NONE;
         } else {
@@ -159,6 +168,7 @@ int diff_object_map(ImageCtx* ictx, uint64_t from_snap_id, uint64_t to_snap_id,
     }
     current_snap_id = next_snap_id;
     prev_object_map = object_map;
+    prev_object_map_valid = true;
   }
   return 0;
 }
@@ -304,6 +314,10 @@ int invoke_async_request(ImageCtx *ictx, const std::string& request_type,
     return image_name + RBD_SUFFIX;
   }
 
+  std::string unique_lock_name(const std::string &name, void *address) {
+    return name + " (" + stringify(address) + ")";
+  }
+
   int detect_format(IoCtx &io_ctx, const string &name,
 		    bool *old_format, uint64_t *size)
   {
@@ -311,12 +325,14 @@ int invoke_async_request(ImageCtx *ictx, const std::string& request_type,
     if (old_format)
       *old_format = true;
     int r = io_ctx.stat(old_header_name(name), size, NULL);
-    if (r < 0) {
+    if (r == -ENOENT) {
       if (old_format)
 	*old_format = false;
       r = io_ctx.stat(id_obj_name(name), size, NULL);
       if (r < 0)
 	return r;
+    } else if (r < 0) {
+      return r;
     }
 
     ldout(cct, 20) << "detect format of " << name << " : "
@@ -719,7 +735,7 @@ int invoke_async_request(ImageCtx *ictx, const std::string& request_type,
     ldout(ictx->cct, 20) << "snap_create_helper " << ictx << " " << snap_name
                          << dendl;
 
-    int r = ictx_check(ictx);
+    int r = ictx_check(ictx, true);
     if (r < 0) {
       return r;
     }
@@ -793,6 +809,7 @@ int invoke_async_request(ImageCtx *ictx, const std::string& request_type,
         return r;
       }
     } else {
+      RWLock::RLocker owner_lock(ictx->owner_lock);
       r = snap_remove_helper(ictx, NULL, snap_name);
       if (r < 0) {
         return r;
@@ -807,10 +824,9 @@ int invoke_async_request(ImageCtx *ictx, const std::string& request_type,
 
   int snap_remove_helper(ImageCtx *ictx, Context *ctx, const char *snap_name)
   {
+    assert(ictx->owner_lock.is_locked());
     {
-      RWLock::RLocker snap_locker(ictx->snap_lock);
       if ((ictx->features & RBD_FEATURE_FAST_DIFF) != 0) {
-        assert(ictx->owner_lock.is_locked());
         assert(!ictx->image_watcher->is_lock_supported() ||
                ictx->image_watcher->is_lock_owner());
       }
@@ -819,7 +835,7 @@ int invoke_async_request(ImageCtx *ictx, const std::string& request_type,
     ldout(ictx->cct, 20) << "snap_remove_helper " << ictx << " " << snap_name
                          << dendl;
 
-    int r = ictx_check(ictx);
+    int r = ictx_check(ictx, true);
     if (r < 0) {
       return r;
     }
@@ -1344,7 +1360,7 @@ reprotect_and_return_err:
     int order;
     uint64_t size;
     uint64_t p_features;
-    int remove_r;
+    int partial_r;
     librbd::NoOpProgressContext no_op;
     ImageCtx *c_imctx = NULL;
     map<string, bufferlist> pairs;
@@ -1415,20 +1431,21 @@ reprotect_and_return_err:
     }
 
     r = cls_client::metadata_list(&p_ioctx, p_imctx->header_oid, "", 0, &pairs);
-    if (r < 0) {
+    if (r < 0 && r != -EOPNOTSUPP && r != -EIO) {
       lderr(cct) << "couldn't list metadata: " << r << dendl;
       goto err_close_child;
-    }
-    r = cls_client::metadata_set(&c_ioctx, c_imctx->header_oid, pairs);
-    if (r < 0) {
-      lderr(cct) << "couldn't set metadata: " << r << dendl;
-      goto err_close_child;
+    } else if (r == 0 && !pairs.empty()) {
+      r = cls_client::metadata_set(&c_ioctx, c_imctx->header_oid, pairs);
+      if (r < 0) {
+        lderr(cct) << "couldn't set metadata: " << r << dendl;
+        goto err_close_child;
+      }
     }
 
-    p_imctx->md_lock.get_write();
-    r = ictx_refresh(p_imctx);
-    p_imctx->md_lock.put_write();
-
+    {
+      RWLock::RLocker owner_locker(p_imctx->owner_lock);
+      r = ictx_refresh(p_imctx);
+    }
     if (r == 0) {
       p_imctx->snap_lock.get_read();
       r = p_imctx->is_snap_protected(p_imctx->snap_id, &snap_protected);
@@ -1441,24 +1458,27 @@ reprotect_and_return_err:
     }
 
     ldout(cct, 2) << "done." << dendl;
-    close_image(c_imctx);
-    close_image(p_imctx);
-    return 0;
+    r = close_image(c_imctx);
+    partial_r = close_image(p_imctx);
+    if (r == 0 && partial_r < 0) {
+      r = partial_r;
+    }
+    return r;
 
   err_remove_child:
-    remove_r = cls_client::remove_child(&c_ioctx, RBD_CHILDREN, pspec,
-					c_imctx->id);
-    if (remove_r < 0) {
+    partial_r = cls_client::remove_child(&c_ioctx, RBD_CHILDREN, pspec,
+                                         c_imctx->id);
+    if (partial_r < 0) {
      lderr(cct) << "Error removing failed clone from list of children: "
-		 << cpp_strerror(remove_r) << dendl;
+                << cpp_strerror(partial_r) << dendl;
     }
   err_close_child:
     close_image(c_imctx);
   err_remove:
-    remove_r = remove(c_ioctx, c_name, no_op);
-    if (remove_r < 0) {
+    partial_r = remove(c_ioctx, c_name, no_op);
+    if (partial_r < 0) {
       lderr(cct) << "Error removing failed clone: "
-		 << cpp_strerror(remove_r) << dendl;
+		 << cpp_strerror(partial_r) << dendl;
     }
   err_close_parent:
     close_image(p_imctx);
@@ -1947,11 +1967,8 @@ reprotect_and_return_err:
         close_image(ictx);
         return -EBUSY;
       }
-      assert(watchers.size() == 1);
 
-      ictx->md_lock.get_read();
       trim_image(ictx, 0, prog_ctx);
-      ictx->md_lock.put_read();
 
       ictx->parent_lock.get_read();
       // struct assignment
@@ -2061,7 +2078,7 @@ reprotect_and_return_err:
 		   << size << dendl;
     ictx->snap_lock.put_read();
 
-    int r = ictx_check(ictx);
+    int r = ictx_check(ictx, true);
     if (r < 0) {
       return r;
     }
@@ -2202,7 +2219,7 @@ reprotect_and_return_err:
     return 0;
   }
 
-  int ictx_check(ImageCtx *ictx)
+  int ictx_check(ImageCtx *ictx, bool owner_locked)
   {
     CephContext *cct = ictx->cct;
     ldout(cct, 20) << "ictx_check " << ictx << dendl;
@@ -2212,9 +2229,13 @@ reprotect_and_return_err:
     ictx->refresh_lock.Unlock();
 
     if (needs_refresh) {
-      RWLock::WLocker l(ictx->md_lock);
-
-      int r = ictx_refresh(ictx);
+      int r;
+      if (owner_locked) {
+        r = ictx_refresh(ictx);
+      } else {
+        RWLock::RLocker owner_lock(ictx->owner_lock);
+        r = ictx_refresh(ictx);
+      }
       if (r < 0) {
 	lderr(cct) << "Error re-reading rbd header: " << cpp_strerror(-r)
 		   << dendl;
@@ -2262,6 +2283,9 @@ reprotect_and_return_err:
 
   int ictx_refresh(ImageCtx *ictx)
   {
+    assert(ictx->owner_lock.is_locked());
+    RWLock::WLocker md_locker(ictx->md_lock);
+
     CephContext *cct = ictx->cct;
     bufferlist bl, bl2;
 
@@ -2458,14 +2482,13 @@ reprotect_and_return_err:
     if (r < 0)
       return r;
 
-    RWLock::RLocker l(ictx->owner_lock);
+    RWLock::RLocker owner_locker(ictx->owner_lock);
     snap_t snap_id;
     uint64_t new_size;
     {
-      RWLock::WLocker l2(ictx->md_lock);
       {
 	// need to drop snap_lock before invalidating cache
-	RWLock::RLocker l3(ictx->snap_lock);
+	RWLock::RLocker snap_locker(ictx->snap_lock);
 	if (!ictx->snap_exists) {
 	  return -ENOENT;
 	}
@@ -2497,6 +2520,7 @@ reprotect_and_return_err:
       // need to flush any pending writes before resizing and rolling back -
       // writes might create new snapshots. Rolling back will replace
       // the current version, so we have to invalidate that too.
+      RWLock::WLocker md_locker(ictx->md_lock);
       ictx->flush_async_operations();
       r = ictx->invalidate_cache();
       if (r < 0) {
@@ -2579,7 +2603,10 @@ reprotect_and_return_err:
     }
 
     r = copy(src, dest, prog_ctx);
-    close_image(dest);
+    int close_r = close_image(dest);
+    if (r == 0 && close_r < 0) {
+      r = close_r;
+    }
     return r;
   }
 
@@ -2621,13 +2648,7 @@ reprotect_and_return_err:
 
       Context *ctx = new C_CopyWrite(m_throttle, m_bl);
       AioCompletion *comp = aio_create_completion_internal(ctx, rbd_ctx_cb);
-      r = aio_write(m_dest, m_offset, m_bl->length(), m_bl->c_str(), comp, 0);
-      if (r < 0) {
-	ctx->complete(r);
-	comp->release();
-	lderr(m_dest->cct) << "error writing to destination image at offset "
-			   << m_offset << ": " << cpp_strerror(r) << dendl;
-      }
+      aio_write(m_dest, m_offset, m_bl->length(), m_bl->c_str(), comp, 0);
     }
   private:
     SimpleThrottle *m_throttle;
@@ -2656,33 +2677,29 @@ reprotect_and_return_err:
     map<string, bufferlist> pairs;
 
     r = cls_client::metadata_list(&src->md_ctx, src->header_oid, "", 0, &pairs);
-    if (r < 0) {
+    if (r < 0 && r != -EOPNOTSUPP && r != -EIO) {
       lderr(cct) << "couldn't list metadata: " << r << dendl;
       return r;
-    }
-    r = cls_client::metadata_set(&dest->md_ctx, dest->header_oid, pairs);
-    if (r < 0) {
-      lderr(cct) << "couldn't set metadata: " << r << dendl;
-      return r;
+    } else if (r == 0 && !pairs.empty()) {
+      r = cls_client::metadata_set(&dest->md_ctx, dest->header_oid, pairs);
+      if (r < 0) {
+        lderr(cct) << "couldn't set metadata: " << r << dendl;
+        return r;
+      }
     }
 
     SimpleThrottle throttle(src->concurrent_management_ops, false);
     uint64_t period = src->get_stripe_period();
     for (uint64_t offset = 0; offset < src_size; offset += period) {
+      if (throttle.pending_error()) {
+        return throttle.wait_for_ret();
+      }
+
       uint64_t len = min(period, src_size - offset);
       bufferlist *bl = new bufferlist();
       Context *ctx = new C_CopyRead(&throttle, dest, offset, bl);
       AioCompletion *comp = aio_create_completion_internal(ctx, rbd_ctx_cb);
-      r = aio_read(src, offset, len, NULL, bl, comp, 0);
-      if (r < 0) {
-	ctx->complete(r);
-	comp->release();
-	throttle.wait_for_ret();
-	lderr(cct) << "could not read from source image from "
-		   << offset << " to " << offset + len << ": "
-		   << cpp_strerror(r) << dendl;
-	return r;
-      }
+      aio_read(src, offset, len, NULL, bl, comp, 0);
       prog_ctx.update_progress(offset, src_size);
     }
 
@@ -2740,7 +2757,8 @@ reprotect_and_return_err:
     if (ictx->object_cacher) {
       // complete pending writes before we're set to a snapshot and
       // get -EROFS for writes
-      RWLock::WLocker l(ictx->md_lock);
+      RWLock::RLocker owner_locker(ictx->owner_lock);
+      RWLock::WLocker md_locker(ictx->md_lock);
       ictx->flush_cache();
     }
     int r = _snap_set(ictx, snap_name);
@@ -2785,9 +2803,10 @@ reprotect_and_return_err:
       }
     }
 
-    ictx->md_lock.get_write();
-    r = ictx_refresh(ictx);
-    ictx->md_lock.put_write();
+    {
+      RWLock::RLocker owner_locker(ictx->owner_lock);
+      r = ictx_refresh(ictx);
+    }
     if (r < 0)
       goto err_close;
 
@@ -2801,7 +2820,7 @@ reprotect_and_return_err:
     return r;
   }
 
-  void close_image(ImageCtx *ictx)
+  int close_image(ImageCtx *ictx)
   {
     ldout(ictx->cct, 20) << "close_image " << ictx << dendl;
 
@@ -2813,13 +2832,23 @@ reprotect_and_return_err:
       }
     }
 
+    ictx->aio_work_queue->drain();
     ictx->cancel_async_requests();
+    ictx->flush_async_operations();
     ictx->readahead.wait_for_pending();
+
+    int r;
     if (ictx->object_cacher) {
-      ictx->shutdown_cache(); // implicitly flushes
+      r = ictx->shutdown_cache(); // implicitly flushes
     } else {
-      flush(ictx);
+      r = flush(ictx);
     }
+    if (r < 0) {
+      lderr(ictx->cct) << "error flushing IO: " << cpp_strerror(r)
+                       << dendl;
+    }
+
+    ictx->op_work_queue->drain();
 
     if (ictx->copyup_finisher != NULL) {
       ictx->copyup_finisher->wait_for_empty();
@@ -2827,7 +2856,10 @@ reprotect_and_return_err:
     }
 
     if (ictx->parent) {
-      close_image(ictx->parent);
+      int close_r = close_image(ictx->parent);
+      if (r == 0 && close_r < 0) {
+        r = close_r;
+      }
       ictx->parent = NULL;
     }
 
@@ -2835,10 +2867,13 @@ reprotect_and_return_err:
       {
 	RWLock::WLocker l(ictx->owner_lock);
 	if (ictx->image_watcher->is_lock_owner()) {
-	  int r = ictx->image_watcher->unlock();
-	  if (r < 0) {
-	    lderr(ictx->cct) << "error unlocking image: " << cpp_strerror(r)
-			     << dendl;
+	  int unlock_r = ictx->image_watcher->unlock();
+	  if (unlock_r < 0) {
+	    lderr(ictx->cct) << "error unlocking image: "
+                             << cpp_strerror(unlock_r) << dendl;
+            if (r == 0) {
+              r = unlock_r;
+            }
 	  }
 	}
       }
@@ -2846,6 +2881,7 @@ reprotect_and_return_err:
     }
 
     delete ictx;
+    return r;
   }
 
   // 'flatten' child image by copying all parent's blocks
@@ -2899,7 +2935,7 @@ reprotect_and_return_err:
 
     int r;
     // ictx_check also updates parent data
-    if ((r = ictx_check(ictx)) < 0) {
+    if ((r = ictx_check(ictx, true)) < 0) {
       lderr(cct) << "ictx_check failed" << dendl;
       return r;
     }
@@ -2977,19 +3013,16 @@ reprotect_and_return_err:
     CephContext *cct = ictx->cct;
     ldout(cct, 20) << "async_rebuild_object_map " << ictx << dendl;
 
-    int r = ictx_check(ictx);
-    if (r < 0) {
-      return r;
+    if (ictx->read_only) {
+      return -EROFS;
+    }
+    if (!ictx->test_features(RBD_FEATURE_OBJECT_MAP)) {
+      return -EINVAL;
     }
 
-    {
-      RWLock::RLocker snap_locker(ictx->snap_lock);
-      if (ictx->read_only) {
-        return -EROFS;
-      }
-      if (!ictx->test_features(RBD_FEATURE_OBJECT_MAP)) {
-        return -EINVAL;
-      }
+    int r = ictx_check(ictx, true);
+    if (r < 0) {
+      return r;
     }
 
     RebuildObjectMapRequest *req = new RebuildObjectMapRequest(*ictx, ctx,
@@ -3184,12 +3217,7 @@ reprotect_and_return_err:
 
       Context *ctx = new C_SafeCond(&mylock, &cond, &done, &ret);
       AioCompletion *c = aio_create_completion_internal(ctx, rbd_ctx_cb);
-      r = aio_read(ictx, off, read_len, NULL, &bl, c, 0);
-      if (r < 0) {
-	c->release();
-	delete ctx;
-	return r;
-      }
+      aio_read(ictx, off, read_len, NULL, &bl, c, 0);
 
       mylock.Lock();
       while (!done)
@@ -3237,7 +3265,10 @@ reprotect_and_return_err:
 			 << " len = " << len << dendl;
 
     // ensure previous writes are visible to listsnaps
-    _flush(ictx);
+    {
+      RWLock::RLocker owner_locker(ictx->owner_lock);
+      _flush(ictx);
+    }
 
     int r = ictx_check(ictx);
     if (r < 0)
@@ -3467,12 +3498,7 @@ reprotect_and_return_err:
 
     Context *ctx = new C_SafeCond(&mylock, &cond, &done, &ret);
     AioCompletion *c = aio_create_completion_internal(ctx, rbd_ctx_cb);
-    int r = aio_read(ictx, image_extents, buf, pbl, c, op_flags);
-    if (r < 0) {
-      c->release();
-      delete ctx;
-      return r;
-    }
+    aio_read(ictx, image_extents, buf, pbl, c, op_flags);
 
     mylock.Lock();
     while (!done)
@@ -3502,12 +3528,7 @@ reprotect_and_return_err:
 
     Context *ctx = new C_SafeCond(&mylock, &cond, &done, &ret);
     AioCompletion *c = aio_create_completion_internal(ctx, rbd_ctx_cb);
-    r = aio_write(ictx, off, mylen, buf, c, op_flags);
-    if (r < 0) {
-      c->release();
-      delete ctx;
-      return r;
-    }
+    aio_write(ictx, off, mylen, buf, c, op_flags);
 
     mylock.Lock();
     while (!done)
@@ -3541,12 +3562,7 @@ reprotect_and_return_err:
 
     Context *ctx = new C_SafeCond(&mylock, &cond, &done, &ret);
     AioCompletion *c = aio_create_completion_internal(ctx, rbd_ctx_cb);
-    r = aio_discard(ictx, off, mylen, c);
-    if (r < 0) {
-      c->release();
-      delete ctx;
-      return r;
-    }
+    aio_discard(ictx, off, mylen, c);
 
     mylock.Lock();
     while (!done)
@@ -3658,19 +3674,20 @@ reprotect_and_return_err:
     return 0;
   }
 
-  int aio_flush(ImageCtx *ictx, AioCompletion *c)
+  void aio_flush(ImageCtx *ictx, AioCompletion *c)
   {
     CephContext *cct = ictx->cct;
     ldout(cct, 20) << "aio_flush " << ictx << " completion " << c <<  dendl;
 
+    c->get();
     int r = ictx_check(ictx);
     if (r < 0) {
-      return r;
+      c->fail(cct, r);
+      return;
     }
 
+    RWLock::RLocker owner_locker(ictx->owner_lock);
     ictx->user_flushed();
-
-    c->get();
 
     C_AioWrite *flush_ctx = new C_AioWrite(cct, c);
     c->add_request();
@@ -3690,8 +3707,6 @@ reprotect_and_return_err:
     c->finish_adding_requests(cct);
     c->put();
     ictx->perfcounter->inc(l_librbd_aio_flush);
-
-    return 0;
   }
 
   int flush(ImageCtx *ictx)
@@ -3705,13 +3720,17 @@ reprotect_and_return_err:
     }
 
     ictx->user_flushed();
-    r = _flush(ictx);
+    {
+      RWLock::RLocker owner_locker(ictx->owner_lock);
+      r = _flush(ictx);
+    }
     ictx->perfcounter->inc(l_librbd_flush);
     return r;
   }
 
   int _flush(ImageCtx *ictx)
   {
+    assert(ictx->owner_lock.is_locked());
     CephContext *cct = ictx->cct;
     int r;
     // flush any outstanding writes
@@ -3740,21 +3759,24 @@ reprotect_and_return_err:
 
     ictx->flush_async_operations();
 
-    RWLock::WLocker l(ictx->md_lock);
+    RWLock::RLocker owner_locker(ictx->owner_lock);
+    RWLock::WLocker md_locker(ictx->md_lock);
     r = ictx->invalidate_cache();
     return r;
   }
 
-  int aio_write(ImageCtx *ictx, uint64_t off, size_t len, const char *buf,
-		AioCompletion *c, int op_flags)
+  void aio_write(ImageCtx *ictx, uint64_t off, size_t len, const char *buf,
+		 AioCompletion *c, int op_flags)
   {
     CephContext *cct = ictx->cct;
     ldout(cct, 20) << "aio_write " << ictx << " off = " << off << " len = "
 		   << len << " buf = " << (void*)buf << dendl;
 
+    c->get();
     int r = ictx_check(ictx);
     if (r < 0) {
-      return r;
+      c->fail(cct, r);
+      return;
     }
 
     RWLock::RLocker owner_locker(ictx->owner_lock);
@@ -3767,25 +3789,27 @@ reprotect_and_return_err:
       // pending async operation
       RWLock::RLocker snap_locker(ictx->snap_lock);
       if (ictx->snap_id != CEPH_NOSNAP || ictx->read_only) {
-        return -EROFS;
+        c->fail(cct, -EROFS);
+        return;
       }
 
       r = clip_io(ictx, off, &clip_len);
       if (r < 0) {
-        return r;
+        c->fail(cct, r);
+        return;
       }
 
       snapc = ictx->snapc;
 
-      c->get();
       c->init_time(ictx, AIO_TYPE_WRITE);
     }
 
     if (ictx->image_watcher->is_lock_supported() &&
 	!ictx->image_watcher->is_lock_owner()) {
       c->put();
-      return ictx->image_watcher->request_lock(
+      ictx->image_watcher->request_lock(
 	boost::bind(&librbd::aio_write, ictx, off, len, buf, _1, op_flags), c);
+      return;
     }
 
     // map
@@ -3816,20 +3840,15 @@ reprotect_and_return_err:
 	c->add_request();
 
 	req->set_op_flags(op_flags);
-	r = req->send();
-	if (r < 0) {
-	  req->complete(r);
-	  goto done;
-	}
+	req->send();
       }
     }
-  done:
+
     c->finish_adding_requests(ictx->cct);
     c->put();
 
     ictx->perfcounter->inc(l_librbd_wr);
     ictx->perfcounter->inc(l_librbd_wr_bytes, clip_len);
-    return r;
   }
 
   int metadata_get(ImageCtx *ictx, const string &key, string *value)
@@ -3885,16 +3904,18 @@ reprotect_and_return_err:
 
     return cls_client::metadata_list(&ictx->md_ctx, ictx->header_oid, start, max, pairs);
   }
-  
-  int aio_discard(ImageCtx *ictx, uint64_t off, uint64_t len, AioCompletion *c)
+
+  void aio_discard(ImageCtx *ictx, uint64_t off, uint64_t len, AioCompletion *c)
   {
     CephContext *cct = ictx->cct;
     ldout(cct, 20) << "aio_discard " << ictx << " off = " << off << " len = "
 		   << len << dendl;
 
+    c->get();
     int r = ictx_check(ictx);
     if (r < 0) {
-      return r;
+      c->fail(cct, r);
+      return;
     }
 
     RWLock::RLocker owner_locker(ictx->owner_lock);
@@ -3907,26 +3928,28 @@ reprotect_and_return_err:
       // pending async operation
       RWLock::RLocker snap_locker(ictx->snap_lock);
       if (ictx->snap_id != CEPH_NOSNAP || ictx->read_only) {
-        return -EROFS;
+        c->fail(cct, -EROFS);
+        return;
       }
 
       r = clip_io(ictx, off, &clip_len);
       if (r < 0) {
-        return r;
+        c->fail(cct, r);
+        return;
       }
 
       // TODO: check for snap
       snapc = ictx->snapc;
 
-      c->get();
       c->init_time(ictx, AIO_TYPE_DISCARD);
     }
 
     if (ictx->image_watcher->is_lock_supported() &&
 	!ictx->image_watcher->is_lock_owner()) {
       c->put();
-      return ictx->image_watcher->request_lock(
+      ictx->image_watcher->request_lock(
 	boost::bind(&librbd::aio_discard, ictx, off, len, _1), c);
+      return;
     }
 
     // map
@@ -3950,20 +3973,16 @@ reprotect_and_return_err:
                               req_comp);
       } else {
 	if(ictx->cct->_conf->rbd_skip_partial_discard) {
+	  delete req_comp;
 	  continue;
 	}
 	req = new AioZero(ictx, p->oid.name, p->objectno, p->offset, p->length,
 			  snapc, req_comp);
       }
 
-      r = req->send();
-      if (r < 0) {
-	req->complete(r);
-	goto done;
-      }
+      req->send();
     }
-    r = 0;
-  done:
+
     if (ictx->object_cacher) {
       Mutex::Locker l(ictx->cache_lock);
       ictx->object_cacher->discard_set(ictx->object_set, extents);
@@ -3972,7 +3991,8 @@ reprotect_and_return_err:
     c->finish_adding_requests(ictx->cct);
     c->put();
 
-    return r;
+    ictx->perfcounter->inc(l_librbd_discard);
+    ictx->perfcounter->inc(l_librbd_discard_bytes, clip_len);
   }
 
   void rbd_req_cb(completion_t cb, void *arg)
@@ -3982,13 +4002,13 @@ reprotect_and_return_err:
     req->complete(comp->get_return_value());
   }
 
-  int aio_read(ImageCtx *ictx, uint64_t off, size_t len,
+  void aio_read(ImageCtx *ictx, uint64_t off, size_t len,
 	       char *buf, bufferlist *bl,
 	       AioCompletion *c, int op_flags)
   {
     vector<pair<uint64_t,uint64_t> > image_extents(1);
     image_extents[0] = make_pair(off, len);
-    return aio_read(ictx, image_extents, buf, bl, c, op_flags);
+    aio_read(ictx, image_extents, buf, bl, c, op_flags);
   }
 
   struct C_RBD_Readahead : public Context {
@@ -4049,14 +4069,17 @@ reprotect_and_return_err:
     }
   }
 
-  int aio_read(ImageCtx *ictx, const vector<pair<uint64_t,uint64_t> >& image_extents,
-	       char *buf, bufferlist *pbl, AioCompletion *c, int op_flags)
+  void aio_read(ImageCtx *ictx, const vector<pair<uint64_t,uint64_t> >& image_extents,
+	        char *buf, bufferlist *pbl, AioCompletion *c, int op_flags)
   {
-    ldout(ictx->cct, 20) << "aio_read " << ictx << " completion " << c << " " << image_extents << dendl;
+    CephContext *cct = ictx->cct;
+    ldout(cct, 20) << "aio_read " << ictx << " completion " << c << " " << image_extents << dendl;
 
+    c->get();
     int r = ictx_check(ictx);
     if (r < 0) {
-      return r;
+      c->fail(cct, r);
+      return;
     }
 
     // readahead
@@ -4081,22 +4104,21 @@ reprotect_and_return_err:
         uint64_t len = p->second;
         r = clip_io(ictx, p->first, &len);
         if (r < 0) {
-	  return r;
+          c->fail(cct, r);
+	  return;
         }
         if (len == 0) {
 	  continue;
         }
 
-        Striper::file_to_extents(ictx->cct, ictx->format_string, &ictx->layout,
+        Striper::file_to_extents(cct, ictx->format_string, &ictx->layout,
 			         p->first, len, 0, object_extents, buffer_ofs);
         buffer_ofs += len;
       }
 
-      c->get();
       c->init_time(ictx, AIO_TYPE_READ);
     }
 
-    int64_t ret;
     c->read_buf = buf;
     c->read_buf_len = buffer_ofs;
     c->read_bl = pbl;
@@ -4117,30 +4139,21 @@ reprotect_and_return_err:
 	c->add_request();
 
 	if (ictx->object_cacher) {
-	  C_CacheRead *cache_comp = new C_CacheRead(req);
+	  C_CacheRead *cache_comp = new C_CacheRead(ictx, req);
 	  ictx->aio_read_from_cache(q->oid, q->objectno, &req->data(),
 				    q->length, q->offset,
 				    cache_comp, op_flags);
 	} else {
-	  r = req->send();
-	  if (r == -ENOENT)
-	    r = 0;
-	  if (r < 0) {
-	    ret = r;
-	    goto done;
-	  }
+	  req->send();
 	}
       }
     }
-    ret = buffer_ofs;
-  done:
-    c->finish_adding_requests(ictx->cct);
+
+    c->finish_adding_requests(cct);
     c->put();
 
     ictx->perfcounter->inc(l_librbd_rd);
     ictx->perfcounter->inc(l_librbd_rd_bytes, buffer_ofs);
-
-    return ret;
   }
 
   AioCompletion *aio_create_completion() {

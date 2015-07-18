@@ -34,6 +34,8 @@ cat > "${EXPUNGE}" <<-!
 			#  remove newlines. This breaks parsing on some
 			#  platforms.
 	generic/050	# blockdev --setro right after mkfs returns EBUSY
+	generic/078 # RENAME_WHITEOUT was enabled in kernel commit 7dcf5c, but causes
+			# a BUG for now
 	generic/081	# ubuntu lvm2 doesn't suport --yes argument
 	generic/083	# mkfs.xfs -dxize=104857600,agcount=6 fails
 			#  when sunit=swidth=8192
@@ -42,6 +44,7 @@ cat > "${EXPUNGE}" <<-!
 	generic/099	# not for Linux
 	generic/204	# stripe size throws off test's math for when to
 			#  expect ENOSPC
+	generic/231 # broken for disk and rbd by xfs kernel commit 4162bb
 
 	shared/272	# not for xfs
 	shared/289	# not for xfs

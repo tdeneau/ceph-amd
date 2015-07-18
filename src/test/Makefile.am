@@ -115,8 +115,6 @@ EXTRA_DIST += \
 	$(srcdir)/test/opensuse-13.2/Dockerfile.in \
 	$(srcdir)/test/opensuse-13.2/install-deps.sh \
 	$(srcdir)/test/opensuse-13.2/ceph.spec.in \
-	$(srcdir)/test/mon/mon-test-helpers.sh \
-	$(srcdir)/test/osd/osd-test-helpers.sh \
         $(srcdir)/test/coverage.sh \
 	$(patsubst %,$(srcdir)/%,$(check_SCRIPTS))
 
@@ -454,6 +452,7 @@ noinst_HEADERS += \
 	test/librados/TestCase.h \
 	test/libradosstriper/TestCase.h \
 	test/librbd/test_fixture.h \
+	test/librbd/test_support.h \
 	test/ObjectMap/KeyValueDBMemory.h \
 	test/omap_bench.h \
 	test/osdc/FakeWriteback.h \

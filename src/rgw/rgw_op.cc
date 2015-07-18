@@ -2314,6 +2314,7 @@ int RGWCopyObj::verify_permission()
 
   if (src_bucket_name.compare(dest_bucket_name) == 0) { /* will only happen if s->local_source */
     dest_bucket_info = src_bucket_info;
+    dest_attrs = src_attrs;
   } else {
     ret = store->get_bucket_info(obj_ctx, dest_bucket_name, dest_bucket_info, NULL, &dest_attrs);
     if (ret < 0)
@@ -2997,7 +2998,7 @@ void RGWCompleteMultipart::execute()
   }
 
   parts = static_cast<RGWMultiCompleteUpload *>(parser.find_first("CompleteMultipartUpload"));
-  if (!parts || parts->parts.size() == 0) {
+  if (!parts || parts->parts.empty()) {
     ret = -ERR_MALFORMED_XML;
     return;
   }

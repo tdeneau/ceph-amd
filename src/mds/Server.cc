@@ -1078,7 +1078,13 @@ void Server::reply_client_request(MDRequestRef& mdr, MClientReply *reply)
   mdr->mark_event("replying");
 
   // note successful request in session map?
-  if (req->may_write() && mdr->session && reply->get_result() == 0) {
+  //
+  // setfilelock requests are special, they only modify states in MDS memory.
+  // The states get lost when MDS fails. If Client re-send a completed
+  // setfilelock request, it means that client did not receive corresponding
+  // setfilelock reply.  So MDS should re-execute the setfilelock request.
+  if (req->may_write() && req->get_op() != CEPH_MDS_OP_SETFILELOCK &&
+      reply->get_result() == 0 && mdr->session) {
     inodeno_t created = mdr->alloc_ino ? mdr->alloc_ino : mdr->used_prealloc_ino;
     mdr->session->add_completed_request(mdr->reqid.tid, created);
     if (mdr->ls) {
@@ -2138,6 +2144,8 @@ CDentry* Server::prepare_null_dentry(MDRequestRef& mdr, CDir *dir, const string&
         respond_to_request(mdr, -EEXIST);
         return 0;
       }
+    } else {
+      dn->first = dir->inode->find_snaprealm()->get_newest_seq() + 1;
     }
 
     return dn;
@@ -2151,7 +2159,7 @@ CDentry* Server::prepare_null_dentry(MDRequestRef& mdr, CDir *dir, const string&
   }
   
   // create
-  dn = dir->add_null_dentry(dname);
+  dn = dir->add_null_dentry(dname, dir->inode->find_snaprealm()->get_newest_seq() + 1);
   dn->mark_new();
   dout(10) << "prepare_null_dentry added " << *dn << dendl;
   return dn;
@@ -2685,6 +2693,11 @@ void Server::handle_client_lookup_ino(MDRequestRef& mdr,
     return;
   }
 
+  if (mdr && in->snaprealm && !in->snaprealm->is_open() &&
+      !in->snaprealm->open_parents(new C_MDS_RetryRequest(mdcache, mdr))) {
+    return;
+  }
+
   CDentry *dn = in->get_projected_parent_dn();
   CInode *diri = dn ? dn->get_dir()->inode : NULL;
   if (dn && (want_parent || want_dentry)) {
@@ -3065,8 +3078,7 @@ void Server::handle_client_openc(MDRequestRef& mdr)
   }
   in->inode.rstat.rfiles = 1;
 
-  if (follows >= dn->first)
-    dn->first = follows+1;
+  assert(dn->first == follows+1);
   in->first = dn->first;
   
   // prepare finisher
@@ -4306,10 +4318,9 @@ class C_MDS_mknod_finish : public MDSInternalContext {
   MDRequestRef mdr;
   CDentry *dn;
   CInode *newi;
-  snapid_t follows;
 public:
-  C_MDS_mknod_finish(MDS *m, MDRequestRef& r, CDentry *d, CInode *ni, snapid_t f) :
-    MDSInternalContext(m), mdr(r), dn(d), newi(ni), follows(f) {}
+  C_MDS_mknod_finish(MDS *m, MDRequestRef& r, CDentry *d, CInode *ni) :
+    MDSInternalContext(m), mdr(r), dn(d), newi(ni) {}
   void finish(int r) {
     assert(r == 0);
 
@@ -4417,8 +4428,7 @@ void Server::handle_client_mknod(MDRequestRef& mdr)
     }
   }
 
-  if (follows >= dn->first)
-    dn->first = follows + 1;
+  assert(dn->first == follows + 1);
   newi->first = dn->first;
     
   dout(10) << "mknod mode " << newi->inode.mode << " rdev " << newi->inode.rdev << dendl;
@@ -4434,7 +4444,7 @@ void Server::handle_client_mknod(MDRequestRef& mdr)
 				    PREDIRTY_PRIMARY|PREDIRTY_DIR, 1);
   le->metablob.add_primary_dentry(dn, newi, true, true, true);
 
-  journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(mds, mdr, dn, newi, follows));
+  journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(mds, mdr, dn, newi));
 }
 
 
@@ -4474,8 +4484,7 @@ void Server::handle_client_mkdir(MDRequestRef& mdr)
   newi->inode.update_backtrace();
 
   dout(12) << " follows " << follows << dendl;
-  if (follows >= dn->first)
-    dn->first = follows + 1;
+  assert(dn->first == follows + 1);
   newi->first = dn->first;
 
   // ...and that new dir is empty.
@@ -4512,7 +4521,7 @@ void Server::handle_client_mkdir(MDRequestRef& mdr)
   LogSegment *ls = mds->mdlog->get_current_segment();
   ls->open_files.push_back(&newi->item_open_file);
 
-  journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(mds, mdr, dn, newi, follows));
+  journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(mds, mdr, dn, newi));
 }
 
 
@@ -4533,8 +4542,6 @@ void Server::handle_client_symlink(MDRequestRef& mdr)
   if (!mds->locker->acquire_locks(mdr, rdlocks, wrlocks, xlocks))
     return;
 
-  snapid_t follows = dn->get_dir()->inode->find_snaprealm()->get_newest_seq();
-
   unsigned mode = S_IFLNK | 0777;
   CInode *newi = prepare_new_inode(mdr, dn->get_dir(), inodeno_t(req->head.ino), mode);
   assert(newi);
@@ -4549,8 +4556,6 @@ void Server::handle_client_symlink(MDRequestRef& mdr)
   newi->inode.version = dn->pre_dirty();
   newi->inode.update_backtrace();
 
-  if (follows >= dn->first)
-    dn->first = follows + 1;
   newi->first = dn->first;
 
   // prepare finisher
@@ -4562,7 +4567,7 @@ void Server::handle_client_symlink(MDRequestRef& mdr)
   mdcache->predirty_journal_parents(mdr, &le->metablob, newi, dn->get_dir(), PREDIRTY_PRIMARY|PREDIRTY_DIR, 1);
   le->metablob.add_primary_dentry(dn, newi, true, true);
 
-  journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(mds, mdr, dn, newi, follows));
+  journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(mds, mdr, dn, newi));
 }
 
 
@@ -4648,10 +4653,6 @@ void Server::_link_local(MDRequestRef& mdr, CDentry *dn, CInode *targeti)
   pi->nlink++;
   pi->ctime = mdr->get_op_stamp();
   pi->version = tipv;
-
-  snapid_t follows = dn->get_dir()->inode->find_snaprealm()->get_newest_seq();
-  if (follows >= dn->first)
-    dn->first = follows;
 
   // log + wait
   EUpdate *le = new EUpdate(mdlog, "link_local");
@@ -8071,7 +8072,7 @@ void Server::_renamesnap_finish(MDRequestRef& mdr, CInode *diri, snapid_t snapid
 
   dout(10) << "snaprealm now " << *diri->snaprealm << dendl;
 
-  mdcache->do_realm_invalidate_and_update_notify(diri, CEPH_SNAP_OP_CREATE, true);
+  mdcache->do_realm_invalidate_and_update_notify(diri, CEPH_SNAP_OP_UPDATE, true);
 
   // yay
   mdr->in[0] = diri;

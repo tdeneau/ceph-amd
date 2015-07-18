@@ -8,7 +8,7 @@ AC_PREREQ(2.59)
 # VERSION define is not used by the code.  It gets a version string
 # from 'git describe'; see src/ceph_ver.[ch]
 
-AC_INIT([ceph], [9.0.1], [ceph-devel@vger.kernel.org])
+AC_INIT([ceph], [9.0.2], [ceph-devel@vger.kernel.org])
 
 # Create release string.  Used with VERSION for RPMs.
 RPM_RELEASE=0
@@ -21,8 +21,16 @@ if test -d ".git" ; then
 fi
 AC_MSG_NOTICE([RPM_RELEASE='$RPM_RELEASE'])
 
-AC_CHECK_PROGS(SPHINX_BUILD, sphinx-1.0-build sphinx-build, no)
-AM_CONDITIONAL(HAS_SPHINX_BUILD, test x"$SPHINX_BUILD" != "xno")
+AC_ARG_WITH([man-pages],
+    [AS_HELP_STRING([--with-man-pages], [build man pages])],
+    [],
+    [with_man_pages=check])
+AS_IF([test "x$with_man_pages" != "xno"],
+  [AC_CHECK_PROGS(SPHINX_BUILD, sphinx-1.0-build sphinx-build)
+   AS_IF([test -z "$SPHINX_BUILD" && \
+          test "x$with_man_pages" = "xyes"],
+     [AC_MSG_ERROR([sphinx-build not found (python-sphinx)])])])
+AM_CONDITIONAL(WITH_MAN_PAGES, test -n "$SPHINX_BUILD")
 
 AC_CONFIG_MACRO_DIR([m4])
 
@@ -42,8 +50,8 @@ AM_PROG_LIBTOOL
 AM_PROG_AS
 
 
+AM_INIT_AUTOMAKE([foreign parallel-tests])
 # enable make V=0 (if automake >1.11)
-AM_INIT_AUTOMAKE([foreign])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
 # Platform
@@ -424,7 +432,7 @@ AS_IF([test "$with_profiler" = "yes"],
 
 # debug crap?
 AC_ARG_WITH([debug],
-            [AS_HELP_STRING([--with-debug], [build extra debug binaries])],
+            [AS_HELP_STRING([--with-debug], [build extra debug binaries and tests])],
             [case "${withval}" in
 		  yes) with_debug=yes ;;
 		  no)  with_debug=no ;;
@@ -1012,7 +1020,7 @@ AC_MSG_RESULT([no])
 ])
 
 AC_MSG_CHECKING([for sched.h])
-+AC_LANG_PUSH([C++])
+AC_LANG_PUSH([C++])
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
 #define _GNU_SOURCE
 #include <sched.h>
@@ -1029,7 +1037,7 @@ AC_DEFINE([HAVE_SCHED], 1, [Define to 1 if you have sched.h.])
 ], [
 AC_MSG_RESULT([no])
 ])
-+AC_LANG_POP([C++])
+AC_LANG_POP([C++])
 
 
 #
@@ -1146,11 +1154,55 @@ AC_ARG_ENABLE([valgrind],
               [AS_HELP_STRING([--enable-valgrind], [enable valgrind unit tests])],
               [enable_valgrind=$enableval], [enable_valgrind=])
 AC_CHECK_PROG(HAVE_VALGRIND, valgrind, yes)
-AS_IF([test "x$HAVE_VALGRIND" = "x"],
-  AS_IF([test "x$enable_valgrind" = "xyes"], [AC_MSG_ERROR([valgrind not found])]),
+AS_IF(
+  [test "x$HAVE_VALGRIND" = "x"], AS_IF([test "x$enable_valgrind" = "xyes"], [AC_MSG_ERROR([valgrind not found])]),
   [test "x$enable_valgrind" = "x"], [enable_valgrind=yes])
 
 AM_CONDITIONAL([VALGRIND_ENABLED], [test "x$enable_valgrind" = "xyes"])
+if test "x$enable_valgrind" = "xyes"; then
+  AC_CHECK_HEADERS([valgrind/helgrind.h])
+fi
+
+dnl systemd-libexec-dir
+AC_SUBST(systemd_libexec_dir)
+AC_ARG_WITH(
+    systemd-libexec-dir,
+    AS_HELP_STRING(
+	    [--with-systemd-libexec-dir=DIR],
+	    [systemd libexec directory @<:@SYSTEMD_LIBEXEC_DIR@:>@
+        defaults to --libexecdir=DIR]
+    ),
+    [
+	    systemd_libexec_dir="$withval"
+    ],
+    [
+        if test "x$SYSTEMD_LIBEXEC_DIR" = "x"; then
+            dnl store old values
+
+            prefix_save=$prefix
+            exec_prefix_save=$exec_prefix
+
+            dnl if no prefix given, then use /usr/local, the default prefix
+            if test "x$prefix" = "xNONE"; then
+                prefix="$ac_default_prefix"
+            fi
+            dnl if no exec_prefix given, then use prefix
+            if test "x$exec_prefix" = "xNONE"; then
+                exec_prefix=$prefix
+            fi
+
+            dnl now get the expanded default
+            systemd_libexec_dir="`eval exec_prefix=$exec_prefix prefix=$prefix echo $libexecdir`"
+
+            dnl now cleanup prefix and exec_prefix
+
+            prefix=$prefix_save
+            exec_prefix=$exec_prefix_save
+        else
+            systemd_libexec_dir="$SYSTEMD_LIBEXEC_DIR"
+        fi
+    ]
+)
 
 # Checks for typedefs, structures, and compiler characteristics.
 #AC_HEADER_STDBOOL
@@ -1214,5 +1266,6 @@ AC_CONFIG_FILES([Makefile
 	src/tracing/Makefile
 	man/Makefile
 	doc/Makefile
+	systemd/ceph-osd@.service
 	ceph.spec])
 AC_OUTPUT

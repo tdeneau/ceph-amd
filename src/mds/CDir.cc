@@ -629,6 +629,7 @@ void CDir::unlink_inode_work( CDentry *dn )
 
 void CDir::add_to_bloom(CDentry *dn)
 {
+  assert(dn->last == CEPH_NOSNAP);
   if (!bloom) {
     /* not create bloom filter for incomplete dir that was added by log replay */
     if (!is_complete())
@@ -1413,9 +1414,17 @@ void CDir::fetch(MDSInternalContextBase *c, const string& want_dn, bool ignore_a
   // unlinked directory inode shouldn't have any entry
   if (inode->inode.nlink == 0 && !inode->snaprealm) {
     dout(7) << "fetch dirfrag for unlinked directory, mark complete" << dendl;
-    if (get_version() == 0)
+    if (get_version() == 0) {
       set_version(1);
+
+      if (state_test(STATE_REJOINUNDEF)) {
+	assert(cache->mds->is_rejoin());
+	state_clear(STATE_REJOINUNDEF);
+	cache->opened_undef_dirfrag(this);
+      }
+    }
     mark_complete();
+
     if (c)
       cache->mds->queue_waiter(c);
     return;
@@ -1773,8 +1782,14 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
 	}
       }
     } else {
-      dout(1) << "corrupt directory, i got tag char '" << type << "' pos " << pos << dendl;
-      assert(0);
+      dout(1) << "corrupt directory, i got tag char '" << type << "' pos "
+        << pos << dendl;
+      cache->mds->clog->error() << "Corrupt directory entry '" << p->first
+        << "' in dirfrag " << *this;
+      // TODO: add a mechanism for selectively marking a path
+      // damaged, rather than marking the whole rank damaged.
+      cache->mds->damaged();
+      assert(0);  // Unreachable: damaged() respawns us
     }
     
     if (dn && want_dn.length() && want_dn == dname) {

@@ -46,6 +46,11 @@ public:
 		  const boost::optional<uint8_t> &current_state,
 		  Context *on_finish);
 
+  void aio_update(uint64_t snap_id, uint64_t start_object_no,
+                  uint64_t end_object_no, uint8_t new_state,
+                  const boost::optional<uint8_t> &current_state,
+                  Context *on_finish);
+
   void refresh(uint64_t snap_id);
   void rollback(uint64_t snap_id);
   void snapshot_add(uint64_t snap_id);
@@ -66,6 +71,9 @@ private:
   protected:
     const uint64_t m_snap_id;
 
+    virtual bool safely_cancel(int r) {
+      return false;
+    }
     virtual bool should_complete(int r);
     virtual int filter_return_code(int r) {
       // never propagate an error back to the caller
