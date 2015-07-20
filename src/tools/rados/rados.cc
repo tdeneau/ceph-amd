@@ -889,7 +889,11 @@ protected:
     if (name_file == NULL) {
       return ObjBencher::generate_object_name(objnum, pid);
     } else {
-      return  name_vector.at(objnum);
+      if (objnum < name_vector.size()) {
+	return  name_vector.at(objnum);
+      } else {
+	return std::string("");
+      }
     }
   }
 

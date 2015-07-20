@@ -338,6 +338,11 @@ int ObjBencher::write_bench(int secondsToRun,
   //set up writes so I can start them together
   for (int i = 0; i<concurrentios; ++i) {
     name[i] = generate_object_name(i);
+    if (name[i].length() == 0) {
+      // limit the number of concurrentios
+      concurrentios = i;
+      break;
+    }
     contents[i] = new bufferlist();
     snprintf(data.object_contents, data.object_size, "I'm the %16dth object!", i);
     contents[i]->append(data.object_contents, data.object_size);
@@ -396,6 +401,10 @@ int ObjBencher::write_bench(int secondsToRun,
     //create new contents and name on the heap, and fill them
     newContents = new bufferlist();
     newName = generate_object_name(data.started);
+    if (newName.length() == 0) {
+      lock.Lock();
+      break;
+    }
     snprintf(data.object_contents, data.object_size, "I'm the %16dth object!", data.started);
     newContents->append(data.object_contents, data.object_size);
     completion_wait(slot);
@@ -538,6 +547,7 @@ int ObjBencher::seq_read_bench(int seconds_to_run, int num_objects, int concurre
   //set up initial reads
   for (int i = 0; i < concurrentios; ++i) {
     name[i] = generate_object_name(i, pid);
+    if (name[i].length() == 0) break;
     contents[i] = new bufferlist();
   }
 
@@ -594,6 +604,7 @@ int ObjBencher::seq_read_bench(int seconds_to_run, int num_objects, int concurre
     }
     lock.Unlock();
     newName = generate_object_name(data.started, pid);
+    if (newName.length() == 0) break;
     int current_index = index[slot];
     index[slot] = data.started;
     completion_wait(slot);
@@ -742,6 +753,7 @@ int ObjBencher::rand_read_bench(int seconds_to_run, int num_objects, int concurr
   //set up initial reads
   for (int i = 0; i < concurrentios; ++i) {
     name[i] = generate_object_name(i, pid);
+    if (name[i].length() == 0) break;
     contents[i] = new bufferlist();
   }
 
@@ -799,6 +811,7 @@ int ObjBencher::rand_read_bench(int seconds_to_run, int num_objects, int concurr
     lock.Unlock();
     rand_id = rand() % num_objects;
     newName = generate_object_name(rand_id, pid);
+    if (newName.length() == 0) break;
     int current_index = index[slot];
     index[slot] = rand_id;
     completion_wait(slot);
@@ -972,6 +985,8 @@ int ObjBencher::clean_up(int num_objects, int prevPid, int concurrentios) {
   //set up initial removes
   for (int i = 0; i < concurrentios; ++i) {
     name[i] = generate_object_name(i, prevPid);
+    if (name[i].length() == 0) break;
+
   }
 
   //start initial removes
@@ -1011,6 +1026,7 @@ int ObjBencher::clean_up(int num_objects, int prevPid, int concurrentios) {
     }
     lock.Unlock();
     newName = generate_object_name(data.started, prevPid);
+    if (newName.length() == 0) break;
     completion_wait(slot);
     lock.Lock();
     r = completion_ret(slot);
