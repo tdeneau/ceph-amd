@@ -889,11 +889,22 @@ protected:
     if (name_file == NULL) {
       return ObjBencher::generate_object_name(objnum, pid);
     } else {
-      if (objnum < name_vector.size()) {
+      if (objnum < (int) name_vector.size()) {
 	return  name_vector.at(objnum);
       } else {
+	cerr << "WARNING: Run may be shorter because reached end of name file\n";
 	return std::string("");
       }
+    }
+  }
+
+  // print name file (if configured) instead of showing object prefix
+  void show_object_prefix()
+  {
+    if (name_file == NULL) {
+      return ObjBencher::show_object_prefix();
+    } else {
+      out(cout) << "Object prefix: Using name file \"" << name_file << "\"\n";
     }
   }
 

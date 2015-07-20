@@ -98,6 +98,7 @@ protected:
 
 protected:
   virtual std::string generate_object_name(int objnum, int pid = 0);
+  virtual void show_object_prefix();
 
 public:
   ObjBencher(CephContext *cct_) : show_time(false), cct(cct_), lock("ObjBencher::lock") {}

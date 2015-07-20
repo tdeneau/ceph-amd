@@ -307,6 +307,13 @@ int ObjBencher::fetch_bench_metadata(const std::string& metadata_file, int* obje
   return 0;
 }
 
+
+// default way to show object prefix
+void ObjBencher::show_object_prefix() {
+  std::string prefix = generate_object_prefix();
+  out(cout) << "Object prefix: " << prefix << std::endl;
+}
+
 int ObjBencher::write_bench(int secondsToRun,
 			    int concurrentios, const string& run_name_meta) {
   if (concurrentios <= 0) 
@@ -318,8 +325,7 @@ int ObjBencher::write_bench(int secondsToRun,
 	    << std::endl;
   bufferlist* newContents = 0;
 
-  std::string prefix = generate_object_prefix();
-  out(cout) << "Object prefix: " << prefix << std::endl;
+  show_object_prefix();
 
   std::vector<string> name(concurrentios);
   std::string newName;
