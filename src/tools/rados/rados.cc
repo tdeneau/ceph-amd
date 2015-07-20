@@ -412,6 +412,17 @@ static int do_put(IoCtx& io_ctx, const char *objname, const char *infile, int op
   return ret;
 }
 
+
+static void read_name_file(const char *name_file, std::vector<std::string> &name_vector) {
+  ifstream file(name_file);
+  if(file.is_open()) {
+    string tmp;
+    while (file >> tmp) {
+      name_vector.push_back(tmp);
+    }
+  }
+}
+
 class RadosWatchCtx : public librados::WatchCtx2 {
   IoCtx& ioctx;
   string name;
@@ -539,7 +550,12 @@ public:
   Mutex lock;
   Cond cond;
 
-  LoadGen(Rados *_rados) : rados(_rados), going_down(false), lock("LoadGen") {
+private:
+  const char* name_file;
+  std::vector<std::string> name_vector;
+
+public:
+  LoadGen(Rados *_rados, const char *_name_file) : rados(_rados), going_down(false), lock("LoadGen"), name_file(_name_file) {
     read_percent = 80;
     min_obj_len = 1024;
     max_obj_len = 5ull * 1024ull * 1024ull * 1024ull;
@@ -554,6 +570,11 @@ public:
     total_completed = 0;
     num_objs = 200;
     max_op = 16;
+
+    // if name_file specified, read it in now
+    if (name_file != NULL) {
+      read_name_file(name_file, name_vector);
+    }
   }
   int bootstrap(const char *pool);
   int run();
@@ -614,9 +635,20 @@ int LoadGen::bootstrap(const char *pool)
   list<librados::AioCompletion *> completions;
   for (i = 0; i < num_objs; i++) {
     obj_info info;
-    gen_rand_alphanumeric(buf, 16);
-    info.name = "obj-";
-    info.name.append(buf);
+    if (name_file == NULL) {
+      // normal random obj name generation
+      gen_rand_alphanumeric(buf, 16);
+      info.name = "obj-";
+      info.name.append(buf);
+    } else {
+      // object name generation using name_file
+      if (i < (int) name_vector.size()) {
+	info.name = name_vector.at(i);
+      } else {
+	cerr << "ERROR: name-file shorter than num-objects\n";
+	return -1;
+      }
+    }
     info.len = get_random(min_obj_len, max_obj_len);
 
     // throttle...
@@ -914,13 +946,7 @@ public:
   {
     // if name_file specified, read it in now
     if (name_file != NULL) {
-      ifstream file(name_file);
-      if(file.is_open()) {
-	string tmp;
-	while (file >> tmp) {
-	  name_vector.push_back(tmp);
-	}
-      }
+      read_name_file(name_file, name_vector);
     }
   }
   ~RadosBencher() { }
@@ -2422,7 +2448,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       cerr << "error: must specify pool" << std::endl;
       usage_exit();
     }
-    LoadGen lg(&rados);
+    LoadGen lg(&rados, name_file);
     if (min_obj_len)
       lg.min_obj_len = min_obj_len;
     if (max_obj_len)
