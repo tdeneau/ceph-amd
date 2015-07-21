@@ -381,6 +381,7 @@ double cond_ping_pong()
 // probably pick worse values.
 double div32()
 {
+#if defined(__i386__) || defined(__x86_64__) || defined(__amd64__)
   int count = 1000000;
   uint64_t start = Cycles::rdtsc();
   // NB: Expect an x86 processor exception is there's overflow.
@@ -397,6 +398,9 @@ double div32()
   }
   uint64_t stop = Cycles::rdtsc();
   return Cycles::to_seconds(stop - start)/count;
+#else
+  return -1;
+#endif
 }
 
 // Measure the cost of a 64-bit divide. Divides don't take a constant
@@ -669,10 +673,12 @@ double perf_prefetch()
  * instructions supposed to be executing before the timer starts.
  */
 static inline void serialize() {
+#if defined(__i386__) || defined(__x86_64__) || defined(__amd64__)
     uint32_t eax, ebx, ecx, edx;
     __asm volatile("cpuid"
         : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
         : "a" (1U));
+#endif
 }
 
 // Measure the cost of cpuid
