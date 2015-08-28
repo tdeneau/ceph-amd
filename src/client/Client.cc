@@ -22,6 +22,7 @@
 #include <sys/param.h>
 #include <fcntl.h>
 #include <sys/utsname.h>
+#include <sys/uio.h>
 
 #if defined(__linux__)
 #include <linux/falloc.h>
@@ -239,11 +240,6 @@ Client::~Client()
   delete logger;
 }
 
-
-
-
-
-
 void Client::tear_down_cache()
 {
   // fd's
@@ -252,8 +248,7 @@ void Client::tear_down_cache()
        ++it) {
     Fh *fh = it->second;
     ldout(cct, 1) << "tear_down_cache forcing close of fh " << it->first << " ino " << fh->inode->ino << dendl;
-    put_inode(fh->inode);
-    delete fh;
+    _release_fh(fh);
   }
   fd_map.clear();
 
@@ -6914,10 +6909,18 @@ int Client::_release_fh(Fh *f)
     ldout(cct, 10) << "_release_fh " << f << " on inode " << *in << " no async_err state" << dendl;
   }
 
-  put_inode(in);
-  delete f;
+  _put_fh(f);
 
   return err;
+}
+
+void Client::_put_fh(Fh *f)
+{
+  int left = f->put();
+  if (!left) {
+    put_inode(f->inode);
+    delete f;
+  }
 }
 
 int Client::_open(Inode *in, int flags, mode_t mode, Fh **fhp, int uid, int gid)
@@ -7133,6 +7136,13 @@ int Client::read(int fd, char *buf, loff_t size, loff_t offset)
   return r;
 }
 
+int Client::preadv(int fd, const struct iovec *iov, int iovcnt, loff_t offset)
+{
+  if (iovcnt < 0)
+    return EINVAL;
+     return _preadv_pwritev(fd, iov, iovcnt, offset, false);
+}
+
 int Client::_read(Fh *f, int64_t offset, uint64_t size, bufferlist *bl)
 {
   const md_config_t *conf = cct->_conf;
@@ -7259,10 +7269,16 @@ done:
   return r < 0 ? r : bl->length();
 }
 
+Client::C_Readahead::C_Readahead(Client *c, Fh *f) :
+  client(c), f(f) {
+    f->get();
+}
+
 void Client::C_Readahead::finish(int r) {
   lgeneric_subdout(client->cct, client, 20) << "client." << client->get_nodeid() << " " << "C_Readahead on " << f->inode << dendl;
   client->put_cap_ref(f->inode, CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
   f->readahead.dec_pending();
+  client->_put_fh(f);
 }
 
 int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl)
@@ -7281,7 +7297,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl)
     len = in->size - off;    
   }
 
-  ldout(cct, 10) << " max_byes=" << conf->client_readahead_max_bytes
+  ldout(cct, 10) << " max_bytes=" << conf->client_readahead_max_bytes
 		 << " max_periods=" << conf->client_readahead_max_periods << dendl;
 
   // read (and possibly block)
@@ -7450,13 +7466,64 @@ int Client::write(int fd, const char *buf, loff_t size, loff_t offset)
   if (fh->flags & O_PATH)
     return -EBADF;
 #endif
-  int r = _write(fh, offset, size, buf);
+  int r = _write(fh, offset, size, buf, NULL, 0);
   ldout(cct, 3) << "write(" << fd << ", \"...\", " << size << ", " << offset << ") = " << r << dendl;
   return r;
 }
 
+int Client::pwritev(int fd, const struct iovec *iov, int iovcnt, int64_t offset)
+{
+  if (iovcnt < 0)
+    return EINVAL;
+    return _preadv_pwritev(fd, iov, iovcnt, offset, true); 
+}
 
-int Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf)
+int Client::_preadv_pwritev(int fd, const struct iovec *iov, unsigned iovcnt, int64_t offset, bool write)
+{
+    Mutex::Locker lock(client_lock);
+    tout(cct) << fd << std::endl;
+    tout(cct) << offset << std::endl;
+
+    Fh *fh = get_filehandle(fd);
+    if (!fh)
+        return -EBADF;
+#if defined(__linux__) && defined(O_PATH)
+    if (fh->flags & O_PATH)
+        return -EBADF;
+#endif
+    loff_t totallen = 0;
+    for (unsigned i = 0; i < iovcnt; i++) {
+        totallen += iov[i].iov_len;
+    }
+    if (write) {
+        int w = _write(fh, offset, totallen, NULL, iov, iovcnt);
+        ldout(cct, 3) << "pwritev(" << fd << ", \"...\", " << totallen << ", " << offset << ") = " << w << dendl;
+        return w;
+    } else {
+        bufferlist bl;
+        int r = _read(fh, offset, totallen, &bl);
+        ldout(cct, 3) << "preadv(" << fd << ", " <<  offset << ") = " << r << dendl;
+        int bufoff = 0;
+        for (unsigned j = 0, resid = r; j < iovcnt && resid > 0; j++) {
+               /*
+                * This piece of code aims to handle the case that bufferlist does not have enough data 
+                * to fill in the iov 
+                */
+               if (resid < iov[j].iov_len) {
+                    bl.copy(bufoff, resid, (char *)iov[j].iov_base);
+                    break;
+               } else {
+                    bl.copy(bufoff, iov[j].iov_len, (char *)iov[j].iov_base);
+               }
+               resid -= iov[j].iov_len;
+               bufoff += iov[j].iov_len;
+        }
+        return r;  
+    }
+}
+
+int Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
+                  const struct iovec *iov, int iovcnt)
 {
   if ((uint64_t)(offset+size) > mdsmap->get_max_filesize()) //too large!
     return -EFBIG;
@@ -7508,10 +7575,22 @@ int Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf)
   }
 
   // copy into fresh buffer (since our write may be resub, async)
-  bufferptr bp;
-  if (size > 0) bp = buffer::copy(buf, size);
   bufferlist bl;
-  bl.push_back( bp );
+  bufferptr *bparr = NULL;
+  if (buf) {
+      bufferptr bp;
+      if (size > 0) bp = buffer::copy(buf, size);
+      bl.push_back( bp );
+  } else if (iov){
+      //iov case 
+      bparr = new bufferptr[iovcnt];
+      for (int i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len > 0) {
+            bparr[i] = buffer::copy((char*)iov[i].iov_base, iov[i].iov_len);
+        }
+        bl.push_back( bparr[i] );
+      }
+  }
 
   utime_t lat;
   uint64_t totalwritten;
@@ -7659,6 +7738,7 @@ done:
   }
 
   put_cap_ref(in, CEPH_CAP_FILE_WR);
+  delete[] bparr; 
   return r;
 }
 
@@ -10205,7 +10285,7 @@ int Client::ll_write(Fh *fh, loff_t off, loff_t len, const char *data)
   tout(cct) << off << std::endl;
   tout(cct) << len << std::endl;
 
-  int r = _write(fh, off, len, data);
+  int r = _write(fh, off, len, data, NULL, 0);
   ldout(cct, 3) << "ll_write " << fh << " " << off << "~" << len << " = " << r
 		<< dendl;
   return r;

@@ -267,9 +267,6 @@ public:
   }
 
   /// Listener methods
-  void on_local_recover_start(
-    const hobject_t &oid,
-    ObjectStore::Transaction *t);
   void on_local_recover(
     const hobject_t &oid,
     const object_stat_sum_t &stat_diff,
@@ -452,7 +449,7 @@ public:
   }
 
   bool transaction_use_tbl() {
-    uint64_t min_features = get_min_peer_features();
+    uint64_t min_features = get_min_upacting_features();
     return !(min_features & CEPH_FEATURE_OSD_TRANSACTION_MAY_LAYOUT);
   }
 
@@ -926,7 +923,11 @@ protected:
   friend struct C_HitSetFlushing;
 
   void agent_setup();       ///< initialize agent state
-  bool agent_work(int max); ///< entry point to do some agent work
+  bool agent_work(int max) ///< entry point to do some agent work
+  {
+    return agent_work(max, max);
+  }
+  bool agent_work(int max, int agent_flush_quota);
   bool agent_maybe_flush(ObjectContextRef& obc);  ///< maybe flush
   bool agent_maybe_evict(ObjectContextRef& obc);  ///< maybe evict
 
@@ -1158,7 +1159,8 @@ protected:
 
   void write_update_size_and_usage(object_stat_sum_t& stats, object_info_t& oi,
 				   interval_set<uint64_t>& modified, uint64_t offset,
-				   uint64_t length, bool count_bytes);
+				   uint64_t length, bool count_bytes,
+				   bool force_changesize=false);
   void add_interval_usage(interval_set<uint64_t>& s, object_stat_sum_t& st);
 
   /**
@@ -1427,13 +1429,14 @@ public:
 private:
   hobject_t earliest_backfill() const;
   bool check_src_targ(const hobject_t& soid, const hobject_t& toid) const;
+
   uint64_t temp_seq; ///< last id for naming temp objects
-  coll_t get_temp_coll(ObjectStore::Transaction *t);
   hobject_t generate_temp_object();  ///< generate a new temp object name
+  /// generate a new temp object name (for recovery)
+  hobject_t get_temp_recovery_object(eversion_t version, snapid_t snap);
 public:
-  void get_colls(list<coll_t> *out) {
-    out->push_back(coll);
-    return pgbackend->temp_colls(out);
+  coll_t get_coll() {
+    return coll;
   }
   void split_colls(
     spg_t child,
@@ -1449,7 +1452,6 @@ public:
       seed,
       target);
     PG::_init(*t, child, pool);
-    pgbackend->split_colls(child, split_bits, seed, t);
   }
 private:
   struct NotTrimming;

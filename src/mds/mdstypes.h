@@ -405,6 +405,13 @@ public:
 };
 WRITE_CLASS_ENCODER(inline_data_t)
 
+enum {
+  DAMAGE_STATS,     // statistics (dirstat, size, etc)
+  DAMAGE_RSTATS,    // recursive statistics (rstat, accounted_rstat)
+  DAMAGE_FRAGTREE   // fragtree -- repair by searching
+};
+typedef uint32_t damage_flags_t;
+
 /*
  * inode_t
  */
@@ -599,6 +606,7 @@ struct fnode_t {
   snapid_t snap_purged_thru;   // the max_last_destroy snapid we've been purged thru
   frag_info_t fragstat, accounted_fragstat;
   nest_info_t rstat, accounted_rstat;
+  damage_flags_t damage_flags;
 
   void encode(bufferlist &bl) const;
   void decode(bufferlist::iterator& bl);
@@ -1577,7 +1585,25 @@ inline std::ostream& operator<<(std::ostream& out, mdsco_db_line_prefix o) {
   return out;
 }
 
+class ceph_file_layout_wrapper : public ceph_file_layout
+{
+public:
+  void encode(bufferlist &bl) const
+  {
+    ::encode(static_cast<const ceph_file_layout&>(*this), bl);
+  }
 
+  void decode(bufferlist::iterator &p)
+  {
+    ::decode(static_cast<ceph_file_layout&>(*this), p);
+  }
+
+  static void generate_test_instances(std::list<ceph_file_layout_wrapper*>& ls)
+  {
+  }
+
+  void dump(Formatter *f) const;
+};
 
 
 

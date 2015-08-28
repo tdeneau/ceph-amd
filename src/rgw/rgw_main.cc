@@ -556,6 +556,8 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
 
   s->req_id = store->unique_id(req->id);
 
+  s->gen_trans_id();
+
   req->log(s, "initializing");
 
   RGWOp *op = NULL;
@@ -1257,8 +1259,6 @@ int main(int argc, const char **argv)
 
   dout(1) << "final shutdown" << dendl;
   g_ceph_context->put();
-
-  ceph::crypto::shutdown();
 
   signal_fd_finalize();
 

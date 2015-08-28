@@ -174,7 +174,8 @@ def test_failure(cmd, errmsg):
             logging.info("Correctly failed with message \"" + errmsg + "\"")
             return 0
         else:
-            logging.error("Bad message to stderr \"" + e.output + "\"")
+            errmsg = e.output.split('\n')[0]
+            logging.error("Bad message to stderr \"" + errmsg + "\"")
             return 1
 
 
@@ -357,7 +358,10 @@ def check_data(DATADIR, TMPFILE, OSDDIR, SPLIT_NAME):
 
 def main(argv):
     sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
-    nullfd = open(os.devnull, "w")
+    if len(argv) > 1 and argv[1] == "debug":
+        nullfd = sys.stdout
+    else:
+        nullfd = open(os.devnull, "w")
 
     call("rm -fr {dir}; mkdir {dir}".format(dir=CEPH_DIR), shell=True)
     os.environ["CEPH_DIR"] = CEPH_DIR
@@ -588,6 +592,22 @@ def main(argv):
     cmd = (CFSD_PREFIX + "--op export --pgid {pg} --file -").format(osd=ONEOSD, pg=ONEPG)
     ERRORS += test_failure_tty(cmd, "stdout is a tty and no --file filename specified")
 
+    # Prep a valid ec export file for import failure tests
+    ONEECPG = ALLECPGS[0]
+    osds = get_osds(ONEECPG, OSDDIR)
+    ONEECOSD = osds[0]
+    OTHERFILE = "/tmp/foo.{pid}".format(pid=pid)
+    cmd = (CFSD_PREFIX + "--op export --pgid {pg} --file {file}").format(osd=ONEECOSD, pg=ONEECPG, file=OTHERFILE)
+    logging.debug(cmd)
+    call(cmd, shell=True, stdout=nullfd, stderr=nullfd)
+
+    # On import can't specify a different shard
+    BADPG = ONEECPG.split('s')[0] + "s10"
+    cmd = (CFSD_PREFIX + "--op import --pgid {pg} --file {file}").format(osd=ONEECOSD, pg=BADPG, file=OTHERFILE)
+    ERRORS += test_failure(cmd, "Can't specify a different shard, must be")
+
+    os.unlink(OTHERFILE)
+
     # Prep a valid export file for import failure tests
     OTHERFILE = "/tmp/foo.{pid}".format(pid=pid)
     cmd = (CFSD_PREFIX + "--op export --pgid {pg} --file {file}").format(osd=ONEOSD, pg=ONEPG, file=OTHERFILE)
@@ -597,6 +617,10 @@ def main(argv):
     # On import can't specify a PG with a non-existent pool
     cmd = (CFSD_PREFIX + "--op import --pgid {pg} --file {file}").format(osd=ONEOSD, pg="10.0", file=OTHERFILE)
     ERRORS += test_failure(cmd, "Can't specify a different pgid pool, must be")
+
+    # On import can't specify shard for a replicated export
+    cmd = (CFSD_PREFIX + "--op import --pgid {pg}s0 --file {file}").format(osd=ONEOSD, pg=ONEPG, file=OTHERFILE)
+    ERRORS += test_failure(cmd, "Can't specify a sharded pgid with a non-sharded export")
 
     # On import can't specify a PG with a bad seed
     TMPPG="{pool}.80".format(pool=REPID)
@@ -630,9 +654,25 @@ def main(argv):
     cmd = (CFSD_PREFIX + "--op remove").format(osd=ONEOSD)
     ERRORS += test_failure(cmd, "Must provide pgid")
 
-    # Don't secify a --op
+    # Don't secify a --op nor object command
     cmd = CFSD_PREFIX.format(osd=ONEOSD)
     ERRORS += test_failure(cmd, "Must provide --op or object command...")
+
+    # Specify a bad --op command
+    cmd = (CFSD_PREFIX + "--op oops").format(osd=ONEOSD)
+    ERRORS += test_failure(cmd, "Must provide --op (info, log, remove, export, import, list, fix-lost, list-pgs, rm-past-intervals, set-allow-sharded-objects, dump-journal, dump-super, meta-list)")
+
+    # Provide just the object param not a command
+    cmd = (CFSD_PREFIX + "object").format(osd=ONEOSD)
+    ERRORS += test_failure(cmd, "Invalid syntax, missing command")
+
+    # Provide an object name that doesn't exist
+    cmd = (CFSD_PREFIX + "NON_OBJECT get-bytes").format(osd=ONEOSD)
+    ERRORS += test_failure(cmd, "No object id 'NON_OBJECT' found")
+
+    # Provide an invalid object command
+    cmd = (CFSD_PREFIX + "--pgid {pg} '' notacommand").format(osd=ONEOSD, pg=ONEPG)
+    ERRORS += test_failure(cmd, "Unknown object command 'notacommand'")
 
     TMPFILE = r"/tmp/tmp.{pid}".format(pid=pid)
     ALLPGS = OBJREPPGS + OBJECPGS
@@ -657,7 +697,7 @@ def main(argv):
     tmpfd.close()
     lines = get_lines(TMPFILE)
     JSONOBJ = sorted(set(lines))
-    (pgid, jsondict) = json.loads(JSONOBJ[0])[0]
+    (pgid, coll, jsondict) = json.loads(JSONOBJ[0])[0]
 
     # retrieve all objects in a given PG
     tmpfd = open(OTHERFILE, "a")
@@ -670,9 +710,9 @@ def main(argv):
     tmpfd.close()
     lines = get_lines(OTHERFILE)
     JSONOBJ = sorted(set(lines))
-    (other_pgid, other_jsondict) = json.loads(JSONOBJ[0])[0]
+    (other_pgid, other_coll, other_jsondict) = json.loads(JSONOBJ[0])[0]
 
-    if pgid != other_pgid or jsondict != other_jsondict:
+    if pgid != other_pgid or jsondict != other_jsondict or coll != other_coll:
         logging.error("the first line of --op list is different "
                       "from the first line of --op list --pgid {pg}".format(pg=pgid))
         ERRORS += 1
@@ -688,9 +728,9 @@ def main(argv):
     tmpfd.close()
     lines = get_lines(OTHERFILE)
     JSONOBJ = sorted(set(lines))
-    (other_pgid, other_jsondict) in json.loads(JSONOBJ[0])[0]
+    (other_pgid, other_coll, other_jsondict) in json.loads(JSONOBJ[0])[0]
 
-    if pgid != other_pgid or jsondict != other_jsondict:
+    if pgid != other_pgid or jsondict != other_jsondict or coll != other_coll:
         logging.error("the first line of --op list is different "
                       "from the first line of --op list --pgid {pg} {object}".format(pg=pgid, object=jsondict['oid']))
         ERRORS += 1
@@ -926,6 +966,48 @@ def main(argv):
                         logging.error("Not all keys found, remaining keys:")
                         print values
 
+    print "Test --op meta-list"
+    tmpfd = open(TMPFILE, "w")
+    cmd = (CFSD_PREFIX + "--op meta-list").format(osd=ONEOSD)
+    logging.debug(cmd)
+    ret = call(cmd, shell=True, stdout=tmpfd)
+    if ret != 0:
+        logging.error("Bad exit status {ret} from --op meta-list request".format(ret=ret))
+        ERRORS += 1
+
+    print "Test get-bytes on meta"
+    tmpfd.close()
+    lines = get_lines(TMPFILE)
+    JSONOBJ = sorted(set(lines))
+    for JSON in JSONOBJ:
+        (pgid, jsondict) = json.loads(JSON)
+        if pgid != "meta":
+            logging.error("pgid incorrect for --op meta-list {pgid}".format(pgid=pgid))
+            ERRORS += 1
+        if jsondict['namespace'] != "":
+            logging.error("namespace non null --op meta-list {ns}".format(ns=jsondict['namespace']))
+            ERRORS += 1
+        logging.info(JSON)
+        try:
+            os.unlink(GETNAME)
+        except:
+            pass
+        cmd = (CFSD_PREFIX + "'{json}' get-bytes {fname}").format(osd=ONEOSD, json=JSON, fname=GETNAME)
+        logging.debug(cmd)
+        ret = call(cmd, shell=True)
+        if ret != 0:
+            logging.error("Bad exit status {ret}".format(ret=ret))
+            ERRORS += 1
+
+    try:
+        os.unlink(GETNAME)
+    except:
+        pass
+    try:
+        os.unlink(TESTNAME)
+    except:
+        pass
+
     print "Test pg info"
     for pg in ALLREPPGS + ALLECPGS:
         for osd in get_osds(pg, OSDDIR):
@@ -1103,36 +1185,46 @@ def main(argv):
         ERRORS += verify(DATADIR, EC_POOL, EC_NAME)
 
     if EXP_ERRORS == 0:
-        NEWPOOL = "import-rados-pool"
+        NEWPOOL = "rados-import-pool"
         cmd = "./rados mkpool {pool}".format(pool=NEWPOOL)
         logging.debug(cmd)
         ret = call(cmd, shell=True, stdout=nullfd, stderr=nullfd)
 
-        print "Test import-rados"
+        print "Test rados import"
+        first = True
         for osd in [f for f in os.listdir(OSDDIR) if os.path.isdir(os.path.join(OSDDIR, f)) and string.find(f, "osd") == 0]:
             dir = os.path.join(TESTDIR, osd)
             for pg in [f for f in os.listdir(dir) if os.path.isfile(os.path.join(dir, f))]:
                 if string.find(pg, "{id}.".format(id=REPID)) != 0:
                     continue
                 file = os.path.join(dir, pg)
-                # This should do nothing
-                cmd = "./ceph-objectstore-tool --dry-run import-rados {pool} {file}".format(pool=NEWPOOL, file=file)
+                if first:
+                    first = False
+                    # This should do nothing
+                    cmd = "./rados import -p {pool} --dry-run {file}".format(pool=NEWPOOL, file=file)
+                    logging.debug(cmd)
+                    ret = call(cmd, shell=True, stdout=nullfd)
+                    if ret != 0:
+                        logging.error("Rados import --dry-run failed from {file} with {ret}".format(file=file, ret=ret))
+                        ERRORS += 1
+                    cmd = "./rados -p {pool} ls".format(pool=NEWPOOL)
+                    logging.debug(cmd)
+                    data = check_output(cmd, shell=True)
+                    if data:
+                        logging.error("'{data}'".format(data=data))
+                        logging.error("Found objects after dry-run")
+                        ERRORS += 1
+                cmd = "./rados import -p {pool} {file}".format(pool=NEWPOOL, file=file)
                 logging.debug(cmd)
                 ret = call(cmd, shell=True, stdout=nullfd)
                 if ret != 0:
-                    logging.error("Import-rados failed from {file} with {ret}".format(file=file, ret=ret))
+                    logging.error("Rados import failed from {file} with {ret}".format(file=file, ret=ret))
                     ERRORS += 1
-                cmd = "./ceph-objectstore-tool import-rados {pool} {file}".format(pool=NEWPOOL, file=file)
+                cmd = "./rados import -p {pool} --no-overwrite {file}".format(pool=NEWPOOL, file=file)
                 logging.debug(cmd)
                 ret = call(cmd, shell=True, stdout=nullfd)
                 if ret != 0:
-                    logging.error("Import-rados failed from {file} with {ret}".format(file=file, ret=ret))
-                    ERRORS += 1
-                cmd = "./ceph-objectstore-tool --no-overwrite import-rados {pool} {file}".format(pool=NEWPOOL, file=file)
-                logging.debug(cmd)
-                ret = call(cmd, shell=True, stdout=nullfd)
-                if ret != 0:
-                    logging.error("Import-rados failed from {file} with {ret}".format(file=file, ret=ret))
+                    logging.error("Rados import --no-overwrite failed from {file} with {ret}".format(file=file, ret=ret))
                     ERRORS += 1
 
         ERRORS += verify(DATADIR, NEWPOOL, REP_NAME)

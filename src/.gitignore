@@ -13,6 +13,7 @@ Makefile
 /ceph-client-debug
 /cephfs-journal-tool
 /cephfs-table-tool
+/cephfs-data-scan
 /ceph-conf
 /ceph-coverage
 /ceph-crush-location
@@ -32,6 +33,8 @@ Makefile
 /ceph_erasure_code_benchmark
 /ceph_erasure_code_non_regression
 /ceph_perf_local
+/ceph_perf_msgr_server
+/ceph_perf_msgr_client
 /ceph_perf_objectstore
 /ceph_psim
 /ceph_radosacl
@@ -89,3 +92,4 @@ Makefile
 /leveldb
 /mkcephfs
 /.ceph_port
+/store_test_temp_dir

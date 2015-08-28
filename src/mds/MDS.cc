@@ -87,6 +87,7 @@
 MDS::MDS(const std::string &n, Messenger *m, MonClient *mc) : 
   Dispatcher(m->cct),
   mds_lock("MDS::mds_lock"),
+  stopping(false),
   timer(m->cct, mds_lock),
   hb(NULL),
   beacon(m->cct, mc, n),
@@ -130,8 +131,6 @@ MDS::MDS(const std::string &n, Messenger *m, MonClient *mc) :
 
   objecter = new Objecter(m->cct, messenger, monc, NULL, 0, 0);
   objecter->unset_honor_osdmap_full();
-
-  filer = new Filer(objecter, &finisher);
 
   mdcache = new MDCache(this);
   mdlog = new MDLog(this);
@@ -181,7 +180,6 @@ MDS::~MDS() {
   if (server) { delete server; server = 0; }
   if (locker) { delete locker; locker = 0; }
 
-  if (filer) { delete filer; filer = 0; }
   if (objecter) { delete objecter; objecter = 0; }
 
   if (logger) {
@@ -242,9 +240,17 @@ bool MDS::asok_command(string command, cmdmap_t& cmdmap, string format,
       f->dump_string("error", "mds_not_active");
     } else if (command == "dump_ops_in_flight" ||
 	       command == "ops") {
-      op_tracker.dump_ops_in_flight(f);
+      if (!op_tracker.tracking_enabled) {
+        ss << "op_tracker tracking is not enabled";
+      } else {
+        op_tracker.dump_ops_in_flight(f);
+      }
     } else if (command == "dump_historic_ops") {
-      op_tracker.dump_historic_ops(f);
+      if (!op_tracker.tracking_enabled) {
+	ss << "op_tracker tracking is not enabled";
+      } else {
+        op_tracker.dump_historic_ops(f);
+      }
     } else if (command == "osdmap barrier") {
       int64_t target_epoch = 0;
       bool got_val = cmd_getval(g_ceph_context, cmdmap, "target_epoch", target_epoch);
@@ -359,6 +365,15 @@ bool MDS::asok_command(string command, cmdmap_t& cmdmap, string format,
       mds_lock.Lock();
       mdcache->force_readonly();
       mds_lock.Unlock();
+    } else if (command == "dirfrag split") {
+      Mutex::Locker l(mds_lock);
+      command_dirfrag_split(cmdmap, ss);
+    } else if (command == "dirfrag merge") {
+      Mutex::Locker l(mds_lock);
+      command_dirfrag_merge(cmdmap, ss);
+    } else if (command == "dirfrag ls") {
+      Mutex::Locker l(mds_lock);
+      command_dirfrag_ls(cmdmap, ss, f);
     }
   }
   f->flush(ss);
@@ -591,6 +606,151 @@ int MDS::_command_export_dir(
   return 0;
 }
 
+CDir *MDS::_command_dirfrag_get(
+    const cmdmap_t &cmdmap,
+    std::ostream &ss)
+{
+  std::string path;
+  bool got = cmd_getval(g_ceph_context, cmdmap, "path", path);
+  if (!got) {
+    ss << "missing path argument";
+    return NULL;
+  }
+
+  std::string frag_str;
+  if (!cmd_getval(g_ceph_context, cmdmap, "frag", frag_str)) {
+    ss << "missing frag argument";
+    return NULL;
+  }
+
+  CInode *in = mdcache->cache_traverse(filepath(path.c_str()));
+  if (!in) {
+    // TODO really we should load something in if it's not in cache,
+    // but the infrastructure is harder, and we might still be unable
+    // to act on it if someone else is auth.
+    ss << "directory '" << path << "' inode not in cache";
+    return NULL;
+  }
+
+  frag_t fg;
+
+  if (!fg.parse(frag_str.c_str())) {
+    ss << "frag " << frag_str << " failed to parse";
+    return NULL;
+  }
+
+  CDir *dir = in->get_dirfrag(fg);
+  if (!dir) {
+    ss << "frag 0x" << std::hex << in->ino() << "/" << fg << " not in cache ("
+          "use `dirfrag ls` to see if it should exist)";
+    return NULL;
+  }
+
+  if (!dir->is_auth()) {
+    ss << "frag " << dir->dirfrag() << " not auth (auth = "
+       << dir->authority() << ")";
+    return NULL;
+  }
+
+  return dir;
+}
+
+bool MDS::command_dirfrag_split(
+    cmdmap_t cmdmap,
+    std::ostream &ss)
+{
+  int64_t by = 0;
+  if (!cmd_getval(g_ceph_context, cmdmap, "bits", by)) {
+    ss << "missing bits argument";
+    return false;
+  }
+
+  if (by <= 0) {
+    ss << "must split by >0 bits";
+    return false;
+  }
+
+  CDir *dir = _command_dirfrag_get(cmdmap, ss);
+  if (!dir) {
+    return false;
+  }
+
+  mdcache->split_dir(dir, by);
+
+  return true;
+}
+
+bool MDS::command_dirfrag_merge(
+    cmdmap_t cmdmap,
+    std::ostream &ss)
+{
+  std::string path;
+  bool got = cmd_getval(g_ceph_context, cmdmap, "path", path);
+  if (!got) {
+    ss << "missing path argument";
+    return false;
+  }
+
+  std::string frag_str;
+  if (!cmd_getval(g_ceph_context, cmdmap, "frag", frag_str)) {
+    ss << "missing frag argument";
+    return false;
+  }
+
+  CInode *in = mdcache->cache_traverse(filepath(path.c_str()));
+  if (!in) {
+    ss << "directory '" << path << "' inode not in cache";
+    return false;
+  }
+
+  frag_t fg;
+  if (!fg.parse(frag_str.c_str())) {
+    ss << "frag " << frag_str << " failed to parse";
+    return false;
+  }
+
+  mdcache->merge_dir(in, fg);
+
+  return true;
+}
+
+bool MDS::command_dirfrag_ls(
+    cmdmap_t cmdmap,
+    std::ostream &ss,
+    Formatter *f)
+{
+  std::string path;
+  bool got = cmd_getval(g_ceph_context, cmdmap, "path", path);
+  if (!got) {
+    ss << "missing path argument";
+    return false;
+  }
+
+  CInode *in = mdcache->cache_traverse(filepath(path.c_str()));
+  if (!in) {
+    ss << "directory inode not in cache";
+    return false;
+  }
+
+  f->open_array_section("frags");
+  std::list<frag_t> frags;
+  // NB using get_leaves_under instead of get_dirfrags to give
+  // you the list of what dirfrags may exist, not which are in cache
+  in->dirfragtree.get_leaves_under(frag_t(), frags);
+  for (std::list<frag_t>::iterator i = frags.begin();
+       i != frags.end(); ++i) {
+    f->open_object_section("frag");
+    f->dump_int("value", i->value());
+    f->dump_int("bits", i->bits());
+    std::ostringstream frag_str;
+    frag_str << std::hex << i->value() << "/" << std::dec << i->bits();
+    f->dump_string("str", frag_str.str());
+    f->close_section();
+  }
+  f->close_section();
+
+  return true;
+}
 
 void MDS::set_up_admin_socket()
 {
@@ -663,6 +823,27 @@ void MDS::set_up_admin_socket()
 				     "get subtrees",
 				     asok_hook,
 				     "Return the subtree map");
+  assert(r == 0);
+  r = admin_socket->register_command("dirfrag split",
+				     "dirfrag split "
+                                     "name=path,type=CephString,req=true "
+                                     "name=frag,type=CephString,req=true "
+                                     "name=bits,type=CephInt,req=true ",
+				     asok_hook,
+				     "Fragment directory by path");
+  assert(r == 0);
+  r = admin_socket->register_command("dirfrag merge",
+				     "dirfrag merge "
+                                     "name=path,type=CephString,req=true "
+                                     "name=frag,type=CephString,req=true",
+				     asok_hook,
+				     "De-fragment directory by path");
+  assert(r == 0);
+  r = admin_socket->register_command("dirfrag ls",
+				     "dirfrag ls "
+                                     "name=path,type=CephString,req=true",
+				     asok_hook,
+				     "List fragments in directory");
   assert(r == 0);
 }
 
@@ -1257,7 +1438,7 @@ COMMAND("heap " \
 	"mds", "*", "cli,rest")
 };
 
-// FIXME: reinstate issue_caps, try_eval, fragment_dir, merge_dir
+// FIXME: reinstate issue_caps, try_eval,
 //  *if* it makes sense to do so (or should these be admin socket things?)
 
 /* This function DOES put the passed message before returning*/
@@ -1551,6 +1732,10 @@ void MDS::handle_mds_map(MMDSMap *m)
   mdsmap->decode(m->get_encoded());
 
   monc->sub_got("mdsmap", mdsmap->get_epoch());
+
+  // Update Beacon early, so that if any of the below code for handling
+  // state changes wants to send a beacon, it reflects the latest epoch.
+  beacon.notify_mdsmap(mdsmap);
 
   // verify compatset
   CompatSet mdsmap_compat(get_mdsmap_compat_set_all());
@@ -1863,8 +2048,6 @@ void MDS::handle_mds_map(MMDSMap *m)
   mdcache->notify_mdsmap_changed();
 
  out:
-  beacon.notify_mdsmap(mdsmap);
-
   m->put();
   delete oldmap;
 }
@@ -2235,6 +2418,29 @@ void MDS::replay_done()
   }
 }
 
+/**
+ * Helper for simple callbacks that call a void fn with no args.
+ */
+class C_VoidFn : public MDSInternalContext
+{
+  typedef void (MDS::*fn_ptr)();
+  protected:
+   MDS *mds_daemon;
+   fn_ptr fn; 
+  public:
+  C_VoidFn(MDS *mds_, fn_ptr fn_)
+    : MDSInternalContext(mds_), mds_daemon(mds_), fn(fn_)
+  {
+    assert(mds_);
+    assert(fn_);
+  }
+
+  void finish(int r)
+  {
+    (mds_daemon->*fn)();
+  }
+};
+
 void MDS::reopen_log()
 {
   dout(1) << "reopen_log" << dendl;
@@ -2248,7 +2454,7 @@ void MDS::resolve_start()
 
   reopen_log();
 
-  mdcache->resolve_start();
+  mdcache->resolve_start(new C_VoidFn(this, &MDS::resolve_done));
   finish_contexts(g_ceph_context, waiting_for_resolve);
 }
 void MDS::resolve_done()
@@ -2264,7 +2470,7 @@ void MDS::reconnect_start()
   if (last_state == MDSMap::STATE_REPLAY)
     reopen_log();
 
-  server->reconnect_clients();
+  server->reconnect_clients(new C_VoidFn(this, &MDS::reconnect_done));
   finish_contexts(g_ceph_context, waiting_for_reconnect);
 }
 void MDS::reconnect_done()
@@ -2281,7 +2487,7 @@ void MDS::rejoin_joint_start()
 void MDS::rejoin_start()
 {
   dout(1) << "rejoin_start" << dendl;
-  mdcache->rejoin_start();
+  mdcache->rejoin_start(new C_VoidFn(this, &MDS::rejoin_done));
 }
 void MDS::rejoin_done()
 {
@@ -2413,14 +2619,19 @@ void MDS::handle_signal(int signum)
 {
   assert(signum == SIGINT || signum == SIGTERM);
   derr << "*** got signal " << sys_siglist[signum] << " ***" << dendl;
-  mds_lock.Lock();
-  suicide();
-  mds_lock.Unlock();
+  {
+    Mutex::Locker l(mds_lock);
+    if (stopping) {
+      return;
+    }
+    suicide();
+  }
 }
 
 void MDS::damaged()
 {
   assert(whoami != MDS_RANK_NONE);
+  assert(mds_lock.is_locked_by_me());
 
   set_want_state(MDSMap::STATE_DAMAGED);
   monc->flush_log();  // Flush any clog error from before we were called
@@ -2437,6 +2648,12 @@ void MDS::damaged()
 void MDS::suicide(bool fast)
 {
   assert(mds_lock.is_locked());
+  // It should never be possible to suicide to get called twice, because
+  // anyone picking up mds_lock checks if stopping is true and drops
+  // out if it is.
+  assert(stopping == false);
+  stopping = true;
+
   set_want_state(MDSMap::STATE_DNE); // whatever.
 
   if (!fast && !mdsmap->is_dne_gid(mds_gid_t(monc->get_global_id()))) {
@@ -2526,7 +2743,10 @@ void MDS::respawn()
 
   dout(0) << "respawn execv " << orig_argv[0]
 	  << " failed with " << cpp_strerror(errno) << dendl;
-  suicide(true);
+
+  // We have to assert out here, because suicide() returns, and callers
+  // to respawn expect it never to return.
+  assert(0);
 }
 
 void MDS::handle_write_error(int err)
@@ -2551,8 +2771,12 @@ void MDS::handle_write_error(int err)
 
 bool MDS::ms_dispatch(Message *m)
 {
-  bool ret;
-  mds_lock.Lock();
+  bool ret = false;
+
+  Mutex::Locker l(mds_lock);
+  if (stopping) {
+    return false;
+  }
 
   heartbeat_reset();
 
@@ -2565,7 +2789,7 @@ bool MDS::ms_dispatch(Message *m)
     ret = _dispatch(m, true);
     dec_dispatch_depth();
   }
-  mds_lock.Unlock();
+
   return ret;
 }
 
@@ -2959,6 +3183,9 @@ bool MDS::ms_handle_reset(Connection *con)
     return false;
 
   Mutex::Locker l(mds_lock);
+  if (stopping) {
+    return false;
+  }
   dout(5) << "ms_handle_reset on " << con->get_peer_addr() << dendl;
   if (want_state == CEPH_MDS_STATE_DNE)
     return false;
@@ -2984,6 +3211,10 @@ void MDS::ms_handle_remote_reset(Connection *con)
     return;
 
   Mutex::Locker l(mds_lock);
+  if (stopping) {
+    return;
+  }
+
   dout(5) << "ms_handle_remote_reset on " << con->get_peer_addr() << dendl;
   if (want_state == CEPH_MDS_STATE_DNE)
     return;
@@ -3004,6 +3235,9 @@ bool MDS::ms_verify_authorizer(Connection *con, int peer_type,
 			       bool& is_valid, CryptoKey& session_key)
 {
   Mutex::Locker l(mds_lock);
+  if (stopping) {
+    return false;
+  }
   if (want_state == CEPH_MDS_STATE_DNE)
     return false;
 
@@ -3090,6 +3324,10 @@ bool MDS::ms_verify_authorizer(Connection *con, int peer_type,
 void MDS::ms_handle_accept(Connection *con)
 {
   Mutex::Locker l(mds_lock);
+  if (stopping) {
+    return;
+  }
+
   Session *s = static_cast<Session *>(con->get_priv());
   dout(10) << "ms_handle_accept " << con->get_peer_addr() << " con " << con << " session " << s << dendl;
   if (s) {
@@ -3143,13 +3381,13 @@ void *MDS::ProgressThread::entry()
 {
   Mutex::Locker l(mds->mds_lock);
   while (true) {
-    while (!stopping &&
+    while (!mds->stopping &&
 	   mds->finished_queue.empty() &&
 	   (mds->waiting_for_nolaggy.empty() || mds->beacon.is_laggy())) {
       cond.Wait(mds->mds_lock);
     }
 
-    if (stopping) {
+    if (mds->stopping) {
       break;
     }
 
@@ -3163,13 +3401,18 @@ void *MDS::ProgressThread::entry()
 void MDS::ProgressThread::shutdown()
 {
   assert(mds->mds_lock.is_locked_by_me());
+  assert(mds->stopping);
 
-  stopping = true;
-  cond.Signal();
-  mds->mds_lock.Unlock();
-  if (is_started())
-    join();
-  mds->mds_lock.Lock();
+  if (am_self()) {
+    // Stopping is set, we will fall out of our main loop naturally
+  } else {
+    // Kick the thread to notice mds->stopping, and join it
+    cond.Signal();
+    mds->mds_lock.Unlock();
+    if (is_started())
+      join();
+    mds->mds_lock.Lock();
+  }
 }
 
 /**

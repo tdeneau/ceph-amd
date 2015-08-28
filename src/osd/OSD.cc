@@ -140,8 +140,6 @@
 #define tracepoint(...)
 #endif
 
-static coll_t META_COLL("meta");
-
 #define dout_subsys ceph_subsys_osd
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, whoami, get_osdmap_epoch())
@@ -221,6 +219,7 @@ OSDService::OSDService(OSD *osd) :
   agent_lock("OSD::agent_lock"),
   agent_valid_iterator(false),
   agent_ops(0),
+  flush_mode_high_count(0),
   agent_active(true),
   agent_thread(this),
   agent_stop_flag(false),
@@ -537,8 +536,12 @@ void OSDService::agent_entry()
     }
     PGRef pg = *agent_queue_pos;
     int max = g_conf->osd_agent_max_ops - agent_ops;
+    int agent_flush_quota = max;
+    if (!flush_mode_high_count)
+      agent_flush_quota = g_conf->osd_agent_max_low_ops - agent_ops;
+    dout(10) << "high_count " << flush_mode_high_count << " agent_ops " << agent_ops << " flush_quota " << agent_flush_quota << dendl;
     agent_lock.Unlock();
-    if (!pg->agent_work(max)) {
+    if (!pg->agent_work(max, agent_flush_quota)) {
       dout(10) << __func__ << " " << *pg
 	<< " no agent_work, delay for " << g_conf->osd_agent_delay_time
 	<< " seconds" << dendl;
@@ -905,6 +908,21 @@ void OSDService::share_map_peer(int peer, Connection *con, OSDMapRef map)
   }
 }
 
+bool OSDService::can_inc_scrubs_pending()
+{
+  bool can_inc = false;
+  Mutex::Locker l(sched_scrub_lock);
+
+  if (scrubs_pending + scrubs_active < cct->_conf->osd_max_scrubs) {
+    dout(20) << __func__ << scrubs_pending << " -> " << (scrubs_pending+1)
+	     << " (max " << cct->_conf->osd_max_scrubs << ", active " << scrubs_active << ")" << dendl;
+    can_inc = true;
+  } else {
+    dout(20) << __func__ << scrubs_pending << " + " << scrubs_active << " active >= max " << cct->_conf->osd_max_scrubs << dendl;
+  }
+
+  return can_inc;
+}
 
 bool OSDService::inc_scrubs_pending()
 {
@@ -1101,8 +1119,8 @@ bool OSDService::_get_map_bl(epoch_t e, bufferlist& bl)
   bool found = map_bl_cache.lookup(e, &bl);
   if (found)
     return true;
-  found = store->read(
-    META_COLL, OSD::get_osdmap_pobject_name(e), 0, 0, bl) >= 0;
+  found = store->read(coll_t::meta(),
+		      OSD::get_osdmap_pobject_name(e), 0, 0, bl) >= 0;
   if (found)
     _add_map_bl(e, bl);
   return found;
@@ -1114,8 +1132,8 @@ bool OSDService::get_inc_map_bl(epoch_t e, bufferlist& bl)
   bool found = map_bl_inc_cache.lookup(e, &bl);
   if (found)
     return true;
-  found = store->read(
-    META_COLL, OSD::get_inc_osdmap_pobject_name(e), 0, 0, bl) >= 0;
+  found = store->read(coll_t::meta(),
+		      OSD::get_inc_osdmap_pobject_name(e), 0, 0, bl) >= 0;
   if (found)
     _add_map_inc_bl(e, bl);
   return found;
@@ -1323,7 +1341,7 @@ int OSD::mkfs(CephContext *cct, ObjectStore *store, const string &dev,
 
     OSDSuperblock sb;
     bufferlist sbbl;
-    ret = store->read(META_COLL, OSD_SUPERBLOCK_POBJECT, 0, 0, sbbl);
+    ret = store->read(coll_t::meta(), OSD_SUPERBLOCK_POBJECT, 0, 0, sbbl);
     if (ret >= 0) {
       dout(0) << " have superblock" << dendl;
       if (whoami != sb.whoami) {
@@ -1353,8 +1371,8 @@ int OSD::mkfs(CephContext *cct, ObjectStore *store, const string &dev,
       ::encode(sb, bl);
 
       ObjectStore::Transaction t;
-      t.create_collection(META_COLL);
-      t.write(META_COLL, OSD_SUPERBLOCK_POBJECT, 0, bl.length(), bl);
+      t.create_collection(coll_t::meta());
+      t.write(coll_t::meta(), OSD_SUPERBLOCK_POBJECT, 0, bl.length(), bl);
       ret = store->apply_transaction(t);
       if (ret) {
 	derr << "OSD::mkfs: error while writing OSD_SUPERBLOCK_POBJECT: "
@@ -1635,9 +1653,17 @@ bool OSD::asok_command(string command, cmdmap_t& cmdmap, string format,
     store->sync_and_flush();
   } else if (command == "dump_ops_in_flight" ||
 	     command == "ops") {
-    op_tracker.dump_ops_in_flight(f);
+    if (!op_tracker.tracking_enabled) {
+      ss << "op_tracker tracking is not enabled";
+    } else {
+      op_tracker.dump_ops_in_flight(f);
+    }
   } else if (command == "dump_historic_ops") {
-    op_tracker.dump_historic_ops(f);
+    if (!op_tracker.tracking_enabled) {
+      ss << "op_tracker tracking is not enabled";
+    } else {
+      op_tracker.dump_historic_ops(f);
+    }
   } else if (command == "dump_op_pq_state") {
     f->open_object_section("pq");
     op_shardedwq.dump(f);
@@ -1810,10 +1836,10 @@ int OSD::init()
   }
 
   // make sure snap mapper object exists
-  if (!store->exists(META_COLL, OSD::make_snapmapper_oid())) {
+  if (!store->exists(coll_t::meta(), OSD::make_snapmapper_oid())) {
     dout(10) << "init creating/touching snapmapper object" << dendl;
     ObjectStore::Transaction t;
-    t.touch(META_COLL, OSD::make_snapmapper_oid());
+    t.touch(coll_t::meta(), OSD::make_snapmapper_oid());
     r = store->apply_transaction(t);
     if (r < 0)
       goto out;
@@ -1844,6 +1870,8 @@ int OSD::init()
     epoch_t bind_epoch = osdmap->get_epoch();
     service.set_epochs(NULL, NULL, &bind_epoch);
   }
+
+  clear_temp_objects();
 
   // load up pgs (as they previously existed)
   load_pgs();
@@ -2443,13 +2471,13 @@ void OSD::write_superblock(ObjectStore::Transaction& t)
 
   bufferlist bl;
   ::encode(superblock, bl);
-  t.write(META_COLL, OSD_SUPERBLOCK_POBJECT, 0, bl.length(), bl);
+  t.write(coll_t::meta(), OSD_SUPERBLOCK_POBJECT, 0, bl.length(), bl);
 }
 
 int OSD::read_superblock()
 {
   bufferlist bl;
-  int r = store->read(META_COLL, OSD_SUPERBLOCK_POBJECT, 0, 0, bl);
+  int r = store->read(coll_t::meta(), OSD_SUPERBLOCK_POBJECT, 0, 0, bl);
   if (r < 0)
     return r;
 
@@ -2461,20 +2489,62 @@ int OSD::read_superblock()
   return 0;
 }
 
+void OSD::clear_temp_objects()
+{
+  dout(10) << __func__ << dendl;
+  vector<coll_t> ls;
+  store->list_collections(ls);
+  for (vector<coll_t>::iterator p = ls.begin(); p != ls.end(); ++p) {
+    spg_t pgid;
+    if (!p->is_pg(&pgid))
+      continue;
 
+    // list temp objects
+    dout(20) << " clearing temps in " << *p << " pgid " << pgid << dendl;
 
-void OSD::recursive_remove_collection(ObjectStore *store, coll_t tmp)
+    vector<ghobject_t> temps;
+    ghobject_t next;
+    while (1) {
+      vector<ghobject_t> objects;
+      store->collection_list_partial(*p, next,
+				     store->get_ideal_list_min(),
+				     store->get_ideal_list_max(),
+				     0, &objects, &next);
+      if (objects.empty())
+	break;
+      vector<ghobject_t>::iterator q;
+      for (q = objects.begin(); q != objects.end(); ++q) {
+	if (q->hobj.is_temp()) {
+	  temps.push_back(*q);
+	} else {
+	  break;
+	}
+      }
+      // If we saw a non-temp object and hit the break above we can
+      // break out of the while loop too.
+      if (q != objects.end())
+	break;
+    }
+    if (!temps.empty()) {
+      ObjectStore::Transaction t;
+      for (vector<ghobject_t>::iterator q = temps.begin(); q != temps.end(); ++q) {
+	dout(20) << "  removing " << *p << " object " << *q << dendl;
+	t.remove(*p, *q);
+      }
+      store->apply_transaction(t);
+    }
+  }
+}
+
+void OSD::recursive_remove_collection(ObjectStore *store, spg_t pgid, coll_t tmp)
 {
   OSDriver driver(
     store,
     coll_t(),
     make_snapmapper_oid());
 
-  spg_t pg;
-  tmp.is_pg_prefix(pg);
-
   ObjectStore::Transaction t;
-  SnapMapper mapper(&driver, 0, 0, 0, pg.shard);
+  SnapMapper mapper(&driver, 0, 0, 0, pgid.shard);
 
   vector<ghobject_t> objects;
   store->collection_list(tmp, objects);
@@ -2764,33 +2834,21 @@ void OSD::load_pgs()
     derr << "failed to list pgs: " << cpp_strerror(-r) << dendl;
   }
 
-  set<spg_t> head_pgs;
-  map<spg_t, interval_set<snapid_t> > pgs;
+  set<spg_t> pgs;
   for (vector<coll_t>::iterator it = ls.begin();
        it != ls.end();
        ++it) {
     spg_t pgid;
-    snapid_t snap;
-    uint64_t seq;
-
-    if (it->is_temp(pgid) ||
-	it->is_removal(&seq, &pgid) ||
-	(it->is_pg(pgid, snap) &&
-	 PG::_has_removal_flag(store, pgid))) {
+    if (it->is_temp(&pgid) ||
+	it->is_removal(&pgid) ||
+	(it->is_pg(&pgid) && PG::_has_removal_flag(store, pgid))) {
       dout(10) << "load_pgs " << *it << " clearing temp" << dendl;
-      recursive_remove_collection(store, *it);
+      recursive_remove_collection(store, pgid, *it);
       continue;
     }
 
-    if (it->is_pg(pgid, snap)) {
-      if (snap != CEPH_NOSNAP) {
-	dout(10) << "load_pgs skipping snapped dir " << *it
-		 << " (pg " << pgid << " snap " << snap << ")" << dendl;
-	pgs[pgid].insert(snap);
-      } else {
-	pgs[pgid];
-	head_pgs.insert(pgid);
-      }
+    if (it->is_pg(&pgid)) {
+      pgs.insert(pgid);
       continue;
     }
 
@@ -2798,16 +2856,8 @@ void OSD::load_pgs()
   }
 
   bool has_upgraded = false;
-  for (map<spg_t, interval_set<snapid_t> >::iterator i = pgs.begin();
-       i != pgs.end();
-       ++i) {
-    spg_t pgid(i->first);
-
-    if (!head_pgs.count(pgid)) {
-      dout(10) << __func__ << ": " << pgid << " has orphan snap collections " << i->second
-	       << " with no head" << dendl;
-      continue;
-    }
+  for (set<spg_t>::iterator i = pgs.begin(); i != pgs.end(); ++i) {
+    spg_t pgid(*i);
 
     if (pgid.preferred() >= 0) {
       dout(10) << __func__ << ": skipping localized PG " << pgid << dendl;
@@ -2858,21 +2908,7 @@ void OSD::load_pgs()
       }
       dout(10) << "PG " << pg->info.pgid
 	       << " must upgrade..." << dendl;
-      pg->upgrade(store, i->second);
-    } else if (!i->second.empty()) {
-      // handle upgrade bug
-      for (interval_set<snapid_t>::iterator j = i->second.begin();
-	   j != i->second.end();
-	   ++j) {
-	for (snapid_t k = j.get_start();
-	     k != j.get_start() + j.get_len();
-	     ++k) {
-	  assert(store->collection_empty(coll_t(pgid, k)));
-	  ObjectStore::Transaction t;
-	  t.remove_collection(coll_t(pgid, k));
-	  store->apply_transaction(t);
-	}
-      }
+      pg->upgrade(store);
     }
 
     service.init_splits_between(pg->info.pgid, pg->get_osdmap(), osdmap);
@@ -2904,10 +2940,10 @@ void OSD::load_pgs()
   }
 
   // clean up old infos object?
-  if (has_upgraded && store->exists(META_COLL, OSD::make_infos_oid())) {
+  if (has_upgraded && store->exists(coll_t::meta(), OSD::make_infos_oid())) {
     dout(1) << __func__ << " removing legacy infos object" << dendl;
     ObjectStore::Transaction t;
-    t.remove(META_COLL, OSD::make_infos_oid());
+    t.remove(coll_t::meta(), OSD::make_infos_oid());
     int r = store->apply_transaction(t);
     if (r != 0) {
       derr << __func__ << ": apply_transaction returned "
@@ -4089,7 +4125,7 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
 
       val.append(valstr);
       newattrs[key] = val;
-      t.omap_setkeys(coll_t(pgid), obj, newattrs);
+      t.omap_setkeys(coll_t(pgid), ghobject_t(obj), newattrs);
       r = store->apply_transaction(t);
       if (r < 0)
         ss << "error=" << r;
@@ -4101,7 +4137,7 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
       cmd_getval(service->cct, cmdmap, "key", key);
 
       keys.insert(key);
-      t.omap_rmkeys(coll_t(pgid), obj, keys);
+      t.omap_rmkeys(coll_t(pgid), ghobject_t(obj), keys);
       r = store->apply_transaction(t);
       if (r < 0)
         ss << "error=" << r;
@@ -4113,7 +4149,7 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
 
       cmd_getval(service->cct, cmdmap, "header", headerstr);
       newheader.append(headerstr);
-      t.omap_setheader(coll_t(pgid), obj, newheader);
+      t.omap_setheader(coll_t(pgid), ghobject_t(obj), newheader);
       r = store->apply_transaction(t);
       if (r < 0)
         ss << "error=" << r;
@@ -4123,7 +4159,7 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
       //Debug: Output entire omap
       bufferlist hdrbl;
       map<string, bufferlist> keyvals;
-      r = store->omap_get(coll_t(pgid), obj, &hdrbl, &keyvals);
+      r = store->omap_get(coll_t(pgid), ghobject_t(obj), &hdrbl, &keyvals);
       if (r >= 0) {
           ss << "header=" << string(hdrbl.c_str(), hdrbl.length());
           for (map<string, bufferlist>::iterator it = keyvals.begin();
@@ -4136,7 +4172,7 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
     } else if (command == "truncobj") {
       int64_t trunclen;
       cmd_getval(service->cct, cmdmap, "len", trunclen);
-      t.truncate(coll_t(pgid), obj, trunclen);
+      t.truncate(coll_t(pgid), ghobject_t(obj), trunclen);
       r = store->apply_transaction(t);
       if (r < 0)
 	ss << "error=" << r;
@@ -4252,21 +4288,15 @@ void OSD::RemoveWQ::_process(
   if (!item.second->start_or_resume_clearing())
     return;
 
-  list<coll_t>& remaining_colls = item.second->colls_to_remove;
-  for (list<coll_t>::iterator i = remaining_colls.begin();
-       i != remaining_colls.end();) {
-    bool cont = remove_dir(
-      pg->cct, store, &mapper, &driver, pg->osr.get(), *i, item.second,
-      &finished, handle);
-    if (!cont)
-      return;
-    if (finished) {
-      i = remaining_colls.erase(i);
-    } else {
-      if (item.second->pause_clearing())
-        queue_front(item);
-      return;
-    }
+  bool cont = remove_dir(
+    pg->cct, store, &mapper, &driver, pg->osr.get(), coll, item.second,
+    &finished, handle);
+  if (!cont)
+    return;
+  if (!finished) {
+    if (item.second->pause_clearing())
+      queue_front(item);
+    return;
   }
 
   if (!item.second->start_deleting())
@@ -4275,18 +4305,11 @@ void OSD::RemoveWQ::_process(
   ObjectStore::Transaction *t = new ObjectStore::Transaction;
   PGLog::clear_info_log(pg->info.pgid, t);
 
-  // remove the collections themselves
-  list<coll_t> colls_to_remove;
-  pg->get_colls(&colls_to_remove);
-  for (list<coll_t>::iterator i = colls_to_remove.begin();
-       i != colls_to_remove.end();
-       ++i) {
-    if (g_conf->osd_inject_failure_on_pg_removal) {
-      generic_derr << "osd_inject_failure_on_pg_removal" << dendl;
-      exit(1);
-    }
-    t->remove_collection(*i);
+  if (g_conf->osd_inject_failure_on_pg_removal) {
+    generic_derr << "osd_inject_failure_on_pg_removal" << dendl;
+    exit(1);
   }
+  t->remove_collection(coll);
 
   // We need the sequencer to stick around until the op is complete
   store->queue_transaction(
@@ -5094,9 +5117,9 @@ void OSD::do_command(Connection *con, ceph_tid_t tid, vector<string>& cmd, buffe
       object_t oid(nm);
       hobject_t soid(sobject_t(oid, 0));
       ObjectStore::Transaction *t = new ObjectStore::Transaction;
-      t->write(META_COLL, soid, 0, bsize, bl);
+      t->write(coll_t::meta(), ghobject_t(soid), 0, bsize, bl);
       store->queue_transaction_and_cleanup(NULL, t);
-      cleanupt->remove(META_COLL, soid);
+      cleanupt->remove(coll_t::meta(), ghobject_t(soid));
     }
     store->sync_and_flush();
     utime_t end = ceph_clock_now(cct);
@@ -5921,6 +5944,11 @@ bool OSD::scrub_load_below_threshold()
 
 void OSD::sched_scrub()
 {
+  // if not permitted, fail fast
+  if (!service.can_inc_scrubs_pending()) {
+    return;
+  }
+
   utime_t now = ceph_clock_now(cct);
   bool time_permit = scrub_time_permit(now);
   bool load_is_low = scrub_load_below_threshold();
@@ -6120,8 +6148,8 @@ void OSD::handle_osd_map(MOSDMap *m)
       if (o->test_flag(CEPH_OSDMAP_FULL))
 	last_marked_full = e;
 
-      hobject_t fulloid = get_osdmap_pobject_name(e);
-      t.write(META_COLL, fulloid, 0, bl.length(), bl);
+      ghobject_t fulloid = get_osdmap_pobject_name(e);
+      t.write(coll_t::meta(), fulloid, 0, bl.length(), bl);
       pin_map_bl(e, bl);
       pinned_maps.push_back(add_map(o));
       continue;
@@ -6131,8 +6159,8 @@ void OSD::handle_osd_map(MOSDMap *m)
     if (p != m->incremental_maps.end()) {
       dout(10) << "handle_osd_map  got inc map for epoch " << e << dendl;
       bufferlist& bl = p->second;
-      hobject_t oid = get_inc_osdmap_pobject_name(e);
-      t.write(META_COLL, oid, 0, bl.length(), bl);
+      ghobject_t oid = get_inc_osdmap_pobject_name(e);
+      t.write(coll_t::meta(), oid, 0, bl.length(), bl);
       pin_map_inc_bl(e, bl);
 
       OSDMap *o = new OSDMap;
@@ -6177,8 +6205,8 @@ void OSD::handle_osd_map(MOSDMap *m)
       }
 
 
-      hobject_t fulloid = get_osdmap_pobject_name(e);
-      t.write(META_COLL, fulloid, 0, fbl.length(), fbl);
+      ghobject_t fulloid = get_osdmap_pobject_name(e);
+      t.write(coll_t::meta(), fulloid, 0, fbl.length(), fbl);
       pin_map_bl(e, fbl);
       pinned_maps.push_back(add_map(o));
       continue;
@@ -6204,8 +6232,8 @@ void OSD::handle_osd_map(MOSDMap *m)
 	  service.map_cache.cached_key_lower_bound()));
     for (epoch_t e = superblock.oldest_map; e < min; ++e) {
       dout(20) << " removing old osdmap epoch " << e << dendl;
-      t.remove(META_COLL, get_osdmap_pobject_name(e));
-      t.remove(META_COLL, get_inc_osdmap_pobject_name(e));
+      t.remove(coll_t::meta(), get_osdmap_pobject_name(e));
+      t.remove(coll_t::meta(), get_inc_osdmap_pobject_name(e));
       superblock.oldest_map = e+1;
       num++;
       if (num >= cct->_conf->osd_target_transaction_size &&
@@ -6222,8 +6250,6 @@ void OSD::handle_osd_map(MOSDMap *m)
     superblock.last_map_marked_full = last_marked_full;
  
   map_lock.get_write();
-
-  C_Contexts *fin = new C_Contexts(cct);
 
   // advance through the new maps
   for (epoch_t cur = start; cur <= superblock.newest_map; cur++) {
@@ -6254,7 +6280,7 @@ void OSD::handle_osd_map(MOSDMap *m)
     osdmap = newmap;
 
     superblock.current_epoch = cur;
-    advance_map(t, fin);
+    advance_map();
     had_map_since = ceph_clock_now(cct);
   }
 
@@ -6358,7 +6384,7 @@ void OSD::handle_osd_map(MOSDMap *m)
     0,
     _t,
     new C_OnMapApply(&service, _t, pinned_maps, osdmap->get_epoch()),
-    0, fin);
+    0, 0);
   service.publish_superblock(superblock);
 
   map_lock.put_write();
@@ -6525,10 +6551,9 @@ bool OSD::advance_pg(
 }
 
 /** 
- * scan placement groups, initiate any replication
- * activities.
+ * update service map; check pg creations
  */
-void OSD::advance_map(ObjectStore::Transaction& t, C_Contexts *tfin)
+void OSD::advance_map()
 {
   assert(osd_lock.is_locked());
 
@@ -7084,37 +7109,6 @@ void OSD::dispatch_context_transaction(PG::RecoveryCtx &ctx, PG *pg,
   }
 }
 
-bool OSD::compat_must_dispatch_immediately(PG *pg)
-{
-  assert(pg->is_locked());
-  set<pg_shard_t> tmpacting;
-  if (!pg->actingbackfill.empty()) {
-    tmpacting = pg->actingbackfill;
-  } else {
-    for (unsigned i = 0; i < pg->acting.size(); ++i) {
-      if (pg->acting[i] == CRUSH_ITEM_NONE)
-	continue;
-      tmpacting.insert(
-	pg_shard_t(
-	  pg->acting[i],
-	  pg->pool.info.ec_pool() ? shard_id_t(i) : shard_id_t::NO_SHARD));
-    }
-  }
-
-  for (set<pg_shard_t>::iterator i = tmpacting.begin();
-       i != tmpacting.end();
-       ++i) {
-    if (i->osd == whoami || i->osd == CRUSH_ITEM_NONE)
-      continue;
-    ConnectionRef conn =
-      service.get_con_osd_cluster(i->osd, pg->get_osdmap()->get_epoch());
-    if (conn && !conn->has_feature(CEPH_FEATURE_INDEP_PG_MAP)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 void OSD::dispatch_context(PG::RecoveryCtx &ctx, PG *pg, OSDMapRef curmap,
                            ThreadPool::TPHandle *handle)
 {
@@ -7169,26 +7163,11 @@ void OSD::do_notifies(
       continue;
     }
     service.share_map_peer(it->first, con.get(), curmap);
-    if (con->has_feature(CEPH_FEATURE_INDEP_PG_MAP)) {
-      dout(7) << __func__ << " osd " << it->first
-	      << " on " << it->second.size() << " PGs" << dendl;
-      MOSDPGNotify *m = new MOSDPGNotify(curmap->get_epoch(),
-					 it->second);
-      con->send_message(m);
-    } else {
-      dout(7) << __func__ << " osd " << it->first
-	      << " sending separate messages" << dendl;
-      for (vector<pair<pg_notify_t, pg_interval_map_t> >::iterator i =
-	     it->second.begin();
-	   i != it->second.end();
-	   ++i) {
-	vector<pair<pg_notify_t, pg_interval_map_t> > list(1);
-	list[0] = *i;
-	MOSDPGNotify *m = new MOSDPGNotify(i->first.epoch_sent,
-					   list);
-	con->send_message(m);
-      }
-    }
+    dout(7) << __func__ << " osd " << it->first
+	    << " on " << it->second.size() << " PGs" << dendl;
+    MOSDPGNotify *m = new MOSDPGNotify(curmap->get_epoch(),
+				       it->second);
+    con->send_message(m);
   }
 }
 
@@ -7214,24 +7193,10 @@ void OSD::do_queries(map<int, map<spg_t,pg_query_t> >& query_map,
       continue;
     }
     service.share_map_peer(who, con.get(), curmap);
-    if (con->has_feature(CEPH_FEATURE_INDEP_PG_MAP)) {
-      dout(7) << __func__ << " querying osd." << who
-	      << " on " << pit->second.size() << " PGs" << dendl;
-      MOSDPGQuery *m = new MOSDPGQuery(curmap->get_epoch(), pit->second);
-      con->send_message(m);
-    } else {
-      dout(7) << __func__ << " querying osd." << who
-	      << " sending seperate messages on " << pit->second.size()
-	      << " PGs" << dendl;
-      for (map<spg_t, pg_query_t>::iterator i = pit->second.begin();
-	   i != pit->second.end();
-	   ++i) {
-	map<spg_t, pg_query_t> to_send;
-	to_send.insert(*i);
-	MOSDPGQuery *m = new MOSDPGQuery(i->second.epoch_sent, to_send);
-	con->send_message(m);
-      }
-    }
+    dout(7) << __func__ << " querying osd." << who
+	    << " on " << pit->second.size() << " PGs" << dendl;
+    MOSDPGQuery *m = new MOSDPGQuery(curmap->get_epoch(), pit->second);
+    con->send_message(m);
   }
 }
 
@@ -7263,22 +7228,9 @@ void OSD::do_infos(map<int,
       continue;
     }
     service.share_map_peer(p->first, con.get(), curmap);
-    if (con->has_feature(CEPH_FEATURE_INDEP_PG_MAP)) {
-      MOSDPGInfo *m = new MOSDPGInfo(curmap->get_epoch());
-      m->pg_list = p->second;
-      con->send_message(m);
-    } else {
-      for (vector<pair<pg_notify_t, pg_interval_map_t> >::iterator i =
-	     p->second.begin();
-	   i != p->second.end();
-	   ++i) {
-	vector<pair<pg_notify_t, pg_interval_map_t> > to_send(1);
-	to_send[0] = *i;
-	MOSDPGInfo *m = new MOSDPGInfo(i->first.epoch_sent);
-	m->pg_list = to_send;
-	con->send_message(m);
-      }
-    }
+    MOSDPGInfo *m = new MOSDPGInfo(curmap->get_epoch());
+    m->pg_list = p->second;
+    con->send_message(m);
   }
   info_map.clear();
 }
@@ -8464,13 +8416,7 @@ void OSD::process_peering_events(
       rctx.on_applied->add(new C_CompleteSplits(this, split_pgs));
       split_pgs.clear();
     }
-    if (compat_must_dispatch_immediately(pg)) {
-      dispatch_context(rctx, pg, curmap, &handle);
-      rctx = create_context();
-      rctx.handle = &handle;
-    } else {
-      dispatch_context_transaction(rctx, pg, &handle);
-    }
+    dispatch_context_transaction(rctx, pg, &handle);
     pg->unlock();
     handle.reset_tp_timeout();
   }

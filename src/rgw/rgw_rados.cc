@@ -915,11 +915,36 @@ RGWPutObjProcessor_Aio::~RGWPutObjProcessor_Aio()
     return;
 
   list<rgw_obj>::iterator iter;
+  bool is_multipart_obj = false;
+  rgw_obj multipart_obj;
+
+  /** 
+   * We should delete the object in the "multipart" namespace to avoid race condition. 
+   * Such race condition is caused by the fact that the multipart object is the gatekeeper of a multipart 
+   * upload, when it is deleted, a second upload would start with the same suffix("2/"), therefore, objects
+   * written by the second upload may be deleted by the first upload.
+   * details is describled on #11749
+   */ 
   for (iter = written_objs.begin(); iter != written_objs.end(); ++iter) {
-    rgw_obj& obj = *iter;
+    rgw_obj &obj = *iter;
+    if (RGW_OBJ_NS_MULTIPART == obj.ns) {
+      ldout(store->ctx(), 5) << "NOTE: we should not process the multipart object (" << obj << ") here" << dendl;
+      multipart_obj = *iter;
+      is_multipart_obj = true;
+      continue;
+    }
+
     int r = store->delete_obj(obj_ctx, bucket_info, obj, 0, 0);
     if (r < 0 && r != -ENOENT) {
-      ldout(store->ctx(), 0) << "WARNING: failed to remove obj (" << obj << "), leaked" << dendl;
+      ldout(store->ctx(), 5) << "WARNING: failed to remove obj (" << obj << "), leaked" << dendl;
+    }
+  }
+
+  if (true == is_multipart_obj) {
+    ldout(store->ctx(), 5) << "NOTE: we are going to process the multipart obj (" << multipart_obj << dendl;
+    int r = store->delete_obj(obj_ctx, bucket_info, multipart_obj, 0, 0);
+    if (r < 0 && r != -ENOENT) {
+      ldout(store->ctx(), 0) << "WARNING: failed to remove obj (" << multipart_obj << "), leaked" << dendl;
     }
   }
 }
@@ -2450,8 +2475,14 @@ int RGWRados::Bucket::List::list_objects(int max, vector<RGWObjEnt> *result,
       RGWObjEnt& entry = eiter->second;
       rgw_obj_key key = obj;
       string instance;
+      string ns;
 
-      bool check_ns = rgw_obj::translate_raw_obj_to_obj_in_ns(obj.name, instance, params.ns);
+      bool valid = rgw_obj::parse_raw_oid(obj.name, &obj.name, &instance, &ns);
+      if (!valid) {
+        ldout(cct, 0) << "ERROR: could not parse object name: " << obj.name << dendl;
+        continue;
+      }
+      bool check_ns = (ns == params.ns);
       if (!params.list_versions && !entry.is_visible()) {
         continue;
       }
@@ -2517,7 +2548,7 @@ int RGWRados::Bucket::List::list_objects(int max, vector<RGWObjEnt> *result,
 
       RGWObjEnt ent = eiter->second;
       ent.key = obj;
-      ent.ns = params.ns;
+      ent.ns = ns;
       result->push_back(ent);
       count++;
     }
@@ -3986,6 +4017,8 @@ int RGWRados::copy_obj(RGWObjectCtx& obj_ctx,
     return ret;
   }
 
+  src_attrs[RGW_ATTR_ACL] = attrs[RGW_ATTR_ACL];
+
   set_copy_attrs(src_attrs, attrs, attrs_mod);
   attrs.erase(RGW_ATTR_ID_TAG);
 
@@ -4984,6 +5017,86 @@ int RGWRados::Object::Read::get_attr(const char *name, bufferlist& dest)
     return -ENOENT;
   if (!state->get_attr(name, dest))
     return -ENODATA;
+
+  return 0;
+}
+
+
+int RGWRados::Object::Stat::stat_async()
+{
+  RGWObjectCtx& ctx = source->get_ctx();
+  rgw_obj& obj = source->get_obj();
+  RGWRados *store = source->get_store();
+
+  RGWObjState *s = ctx.get_state(obj); /* calling this one directly because otherwise a sync request will be sent */
+  result.obj = obj;
+  if (s->has_attrs) {
+    state.ret = 0;
+    result.size = s->size;
+    result.mtime = s->mtime;
+    result.attrs = s->attrset;
+    result.has_manifest = s->has_manifest;
+    result.manifest = s->manifest;
+    return 0;
+  }
+
+  string oid;
+  string loc;
+  rgw_bucket bucket;
+  get_obj_bucket_and_oid_loc(obj, bucket, oid, loc);
+
+  int r = store->get_obj_ioctx(obj, &state.io_ctx);
+  if (r < 0) {
+    return r;
+  }
+
+  librados::ObjectReadOperation op;
+  op.stat(&result.size, &result.mtime, NULL);
+  op.getxattrs(&result.attrs, NULL);
+  state.completion = librados::Rados::aio_create_completion(NULL, NULL, NULL);
+  state.io_ctx.locator_set_key(loc);
+  r = state.io_ctx.aio_operate(oid, state.completion, &op, NULL);
+  if (r < 0) {
+    ldout(store->ctx(), 5) << __func__ << ": ERROR: aio_operate() returned ret=" << r << dendl;
+    return r;
+  }
+
+  return 0;
+}
+
+
+int RGWRados::Object::Stat::wait()
+{
+  if (!state.completion) {
+    return state.ret;
+  }
+
+  state.completion->wait_for_complete();
+  state.ret = state.completion->get_return_value();
+  state.completion->release();
+
+  if (state.ret != 0) {
+    return state.ret;
+  }
+
+  return finish();
+}
+
+int RGWRados::Object::Stat::finish()
+{
+  map<string, bufferlist>::iterator iter = result.attrs.find(RGW_ATTR_MANIFEST);
+  if (iter != result.attrs.end()) {
+    bufferlist& bl = iter->second;
+    bufferlist::iterator biter = bl.begin();
+    try {
+      ::decode(result.manifest, biter);
+    } catch (buffer::error& err) {
+      RGWRados *store = source->get_store();
+      ldout(store->ctx(), 0) << "ERROR: " << __func__ << ": failed to decode manifest"  << dendl;
+      return -EIO;
+    }
+    result.has_manifest = true;
+  }
 
   return 0;
 }

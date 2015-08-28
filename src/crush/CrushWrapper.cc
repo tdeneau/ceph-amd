@@ -832,7 +832,7 @@ int CrushWrapper::adjust_item_weight_in_loc(CephContext *cct, int id, int weight
 
 int CrushWrapper::adjust_subtree_weight(CephContext *cct, int id, int weight)
 {
-  ldout(cct, 5) << "adjust_item_weight " << id << " weight " << weight << dendl;
+  ldout(cct, 5) << __func__ << " " << id << " weight " << weight << dendl;
   crush_bucket *b = get_bucket(id);
   if (IS_ERR(b))
     return PTR_ERR(b);
@@ -842,16 +842,22 @@ int CrushWrapper::adjust_subtree_weight(CephContext *cct, int id, int weight)
   while (!q.empty()) {
     b = q.front();
     q.pop_front();
+    int local_changed = 0;
     for (unsigned i=0; i<b->size; ++i) {
       int n = b->items[i];
       if (n >= 0) {
 	crush_bucket_adjust_item_weight(crush, b, n, weight);
+	++changed;
+	++local_changed;
       } else {
 	crush_bucket *sub = get_bucket(n);
 	if (IS_ERR(sub))
 	  continue;
 	q.push_back(sub);
       }
+    }
+    if (local_changed) {
+      adjust_item_weight(cct, b->id, b->weight);
     }
   }
   return changed;
@@ -1454,6 +1460,56 @@ void CrushWrapper::dump(Formatter *f) const
   f->open_object_section("tunables");
   dump_tunables(f);
   f->close_section();
+}
+
+namespace {
+  // depth first walker
+  class TreeDumper {
+    typedef CrushTreeDumper::Item Item;
+    const CrushWrapper *crush;
+  public:
+    TreeDumper(const CrushWrapper *crush)
+      : crush(crush) {}
+
+    void dump(Formatter *f) {
+      set<int> roots;
+      crush->find_roots(roots);
+      for (set<int>::iterator root = roots.begin(); root != roots.end(); ++root) {
+	dump_item(Item(*root, 0, crush->get_bucket_weightf(*root)), f);
+      }
+    }
+
+  private:
+    void dump_item(const Item& qi, Formatter* f) {
+      if (qi.is_bucket()) {
+	f->open_object_section("bucket");
+	CrushTreeDumper::dump_item_fields(crush, qi, f);
+	dump_bucket_children(qi, f);
+	f->close_section();
+      } else {
+	f->open_object_section("device");
+	CrushTreeDumper::dump_item_fields(crush, qi, f);
+	f->close_section();
+      }
+    }
+
+    void dump_bucket_children(const Item& parent, Formatter* f) {
+      f->open_array_section("items");
+      const int max_pos = crush->get_bucket_size(parent.id);
+      for (int pos = 0; pos < max_pos; pos++) {
+	int id = crush->get_bucket_item(parent.id, pos);
+	float weight = crush->get_bucket_item_weightf(parent.id, pos);
+	dump_item(Item(id, parent.depth + 1, weight), f);
+      }
+      f->close_section();
+    }
+  };
+}
+
+void CrushWrapper::dump_tree(Formatter *f) const
+{
+  assert(f);
+  TreeDumper(this).dump(f);
 }
 
 void CrushWrapper::dump_tunables(Formatter *f) const

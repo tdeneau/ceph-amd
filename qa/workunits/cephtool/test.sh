@@ -4,7 +4,7 @@ source $(dirname $0)/../ceph-helpers.sh
 
 set -e
 set -o functrace
-PS4=' ${FUNCNAME[0]}: $LINENO: '
+PS4='${BASH_SOURCE[0]}:$LINENO: ${FUNCNAME[0]}:  '
 SUDO=${SUDO:-sudo}
 
 function check_no_osd_down()
@@ -302,10 +302,8 @@ function test_tiering()
   # make sure we can't clobber snapshot state
   ceph osd pool create snap_base 2
   ceph osd pool create snap_cache 2
-  rbd -p snap_cache create foo --size 10
-  rbd -p snap_cache snap create foo --snap snap1
-  rbd -p snap_cache snap rm foo --snap snap1
-  expect_false ceph osd tier add snap_base snap_cache --force-nonempty
+  ceph osd pool mksnap snap_cache snapname
+  expect_false ceph osd tier add snap_base snap_cache
   ceph osd pool delete snap_base snap_base --yes-i-really-really-mean-it
   ceph osd pool delete snap_cache snap_cache --yes-i-really-really-mean-it
 
@@ -578,7 +576,8 @@ function test_mon_misc()
   ceph log "$mymsg"
   ceph_watch_wait "$mymsg"
 
-  ceph mon_metadata a
+  ceph mon metadata a
+  ceph node ls
 }
 
 function check_mds_active()
@@ -733,7 +732,11 @@ function test_mon_mds()
   ceph osd pool delete data3 data3 --yes-i-really-really-mean-it
   ceph mds set_max_mds 4
   ceph mds set_max_mds 3
+  ceph mds set_max_mds 256
+  expect_false ceph mds set_max_mds 257
   ceph mds set max_mds 4
+  ceph mds set max_mds 256
+  expect_false ceph mds set max_mds 257
   expect_false ceph mds set max_mds asdf
   expect_false ceph mds set inline_data true
   ceph mds set inline_data true --yes-i-really-mean-it
@@ -882,6 +885,25 @@ function test_mon_mds()
 
   ceph osd pool delete fs_data fs_data --yes-i-really-really-mean-it
   ceph osd pool delete fs_metadata fs_metadata --yes-i-really-really-mean-it
+}
+
+function test_mon_mds_metadata()
+{
+  local nmons=$(ceph tell 'mon.*' version | grep -c 'version')
+  test "$nmons" -gt 0
+
+  ceph mds dump |
+  sed -nEe "s/^([0-9]+):.*'([a-z])' mds\\.([0-9]+)\\..*/\\1 \\2 \\3/p" |
+  while read gid id rank; do
+    ceph mds metadata ${gid} | grep '"hostname":'
+    ceph mds metadata ${id} | grep '"hostname":'
+    ceph mds metadata ${rank} | grep '"hostname":'
+
+    local n=$(ceph tell 'mon.*' mds metadata ${id} | grep -c '"hostname":')
+    test "$n" -eq "$nmons"
+  done
+
+  expect_false ceph mds metadata UNKNOWN
 }
 
 function test_mon_mon()
@@ -1354,6 +1376,11 @@ function test_mon_osd_tiered_pool_set()
     grep 'cache_target_dirty_ratio:[ \t]\+0.123'
   expect_false ceph osd pool set real-tier cache_target_dirty_ratio -.2
   expect_false ceph osd pool set real-tier cache_target_dirty_ratio 1.1
+  ceph osd pool set real-tier cache_target_dirty_high_ratio .123
+  ceph osd pool get real-tier cache_target_dirty_high_ratio | \
+    grep 'cache_target_dirty_high_ratio:[ \t]\+0.123'
+  expect_false ceph osd pool set real-tier cache_target_dirty_high_ratio -.2
+  expect_false ceph osd pool set real-tier cache_target_dirty_high_ratio 1.1
   ceph osd pool set real-tier cache_target_full_ratio .123
   ceph osd pool get real-tier cache_target_full_ratio | \
     grep 'cache_target_full_ratio:[ \t]\+0.123'
@@ -1394,6 +1421,10 @@ function test_mon_osd_tiered_pool_set()
   expect_false ceph osd pool get fake-tier cache_target_dirty_ratio
   expect_false ceph osd pool set fake-tier cache_target_dirty_ratio -.2
   expect_false ceph osd pool set fake-tier cache_target_dirty_ratio 1.1
+  expect_false ceph osd pool set fake-tier cache_target_dirty_high_ratio .123
+  expect_false ceph osd pool get fake-tier cache_target_dirty_high_ratio
+  expect_false ceph osd pool set fake-tier cache_target_dirty_high_ratio -.2
+  expect_false ceph osd pool set fake-tier cache_target_dirty_high_ratio 1.1
   expect_false ceph osd pool set fake-tier cache_target_full_ratio .123
   expect_false ceph osd pool get fake-tier cache_target_full_ratio
   expect_false ceph osd pool set fake-tier cache_target_full_ratio 1.0
@@ -1592,6 +1623,30 @@ function test_mon_ping()
   ceph ping mon.*
 }
 
+function test_mon_deprecated_commands()
+{
+  # current DEPRECATED commands are:
+  #  ceph compact
+  #  ceph scrub
+  #  ceph sync force
+  #
+  # Testing should be accomplished by setting
+  # 'mon_debug_deprecated_as_obsolete = true' and expecting ENOTSUP for
+  # each one of these commands.
+
+  ceph tell mon.a injectargs '--mon-debug-deprecated-as-obsolete'
+  expect_false ceph tell mon.a compact 2> $TMPFILE
+  check_response "ENOTSUP: command is obsolete"
+
+  expect_false ceph tell mon.a scrub 2> $TMPFILE
+  check_response "ENOTSUP: command is obsolete"
+
+  expect_false ceph tell mon.a sync force 2> $TMPFILE
+  check_response "ENOTSUP: command is obsolete"
+
+  ceph tell mon.a injectargs '--no-mon-debug-deprecated-as-obsolete'
+}
+
 #
 # New tests should be added to the TESTS array below
 #
@@ -1628,11 +1683,13 @@ MON_TESTS+=" mon_heap_profiler"
 MON_TESTS+=" mon_tell"
 MON_TESTS+=" mon_crushmap_validation"
 MON_TESTS+=" mon_ping"
+MON_TESTS+=" mon_deprecated_commands"
 
 OSD_TESTS+=" osd_bench"
 
 MDS_TESTS+=" mds_tell"
 MDS_TESTS+=" mon_mds"
+MDS_TESTS+=" mon_mds_metadata"
 
 TESTS+=$MON_TESTS
 TESTS+=$OSD_TESTS

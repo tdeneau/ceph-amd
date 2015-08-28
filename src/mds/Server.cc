@@ -674,8 +674,9 @@ void Server::journal_close_session(Session *session, int state, Context *on_safe
   finish_flush_session(session, session->get_push_seq());
 }
 
-void Server::reconnect_clients()
+void Server::reconnect_clients(MDSInternalContext *reconnect_done_)
 {
+  reconnect_done = reconnect_done_;
   mds->sessionmap.get_client_set(client_reconnect_gather);
 
   if (client_reconnect_gather.empty()) {
@@ -810,7 +811,9 @@ void Server::handle_client_reconnect(MClientReconnect *m)
 void Server::reconnect_gather_finish()
 {
   dout(7) << "reconnect_gather_finish.  failed on " << failed_reconnects << " clients" << dendl;
-  mds->reconnect_done();
+  assert(reconnect_done);
+  reconnect_done->complete(0);
+  reconnect_done = NULL;
 }
 
 void Server::reconnect_tick()
@@ -3862,7 +3865,7 @@ struct keys_and_values
 };
 
 int Server::parse_layout_vxattr(string name, string value, const OSDMap *osdmap,
-				ceph_file_layout *layout)
+				ceph_file_layout *layout, bool validate)
 {
   dout(20) << "parse_layout_vxattr name " << name << " value '" << value << "'" << dendl;
   try {
@@ -3879,7 +3882,10 @@ int Server::parse_layout_vxattr(string name, string value, const OSDMap *osdmap,
       if (begin != end)
 	return -EINVAL;
       for (map<string,string>::iterator q = m.begin(); q != m.end(); ++q) {
-	int r = parse_layout_vxattr(string("layout.") + q->first, q->second, osdmap, layout);
+        // Skip validation on each attr, we do it once at the end (avoid
+        // rejecting intermediate states if the overall result is ok)
+	int r = parse_layout_vxattr(string("layout.") + q->first, q->second,
+                                    osdmap, layout, false);
 	if (r < 0)
 	  return r;
       }
@@ -3909,7 +3915,7 @@ int Server::parse_layout_vxattr(string name, string value, const OSDMap *osdmap,
     return -EINVAL;
   }
 
-  if (!ceph_file_layout_is_valid(layout)) {
+  if (validate && !ceph_file_layout_is_valid(layout)) {
     dout(10) << "bad layout" << dendl;
     return -EINVAL;
   }

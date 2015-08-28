@@ -17,13 +17,16 @@
 #
 source test/test_btrfs_common.sh
 
-PS4='${FUNCNAME[0]}: $LINENO: '
+PS4='${BASH_SOURCE[0]}:$LINENO: ${FUNCNAME[0]}:  '
 
 export PATH=.:$PATH # make sure program from sources are prefered
 DIR=test-ceph-disk
 virtualenv virtualenv-$DIR
 . virtualenv-$DIR/bin/activate
 (
+    # older versions of pip will not install wrap_console scripts
+    # when using wheel packages
+    pip install --upgrade 'pip >= 6.1'
     if test -d ceph-detect-init/wheelhouse ; then
         wheelhouse="--no-index --use-wheel --find-links=ceph-detect-init/wheelhouse"
     fi

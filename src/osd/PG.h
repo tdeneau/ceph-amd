@@ -292,10 +292,7 @@ public:
   bool can_upgrade() {
     return info_struct_v >= compat_struct_v;
   }
-  void upgrade(
-    ObjectStore *store,
-    const interval_set<snapid_t> &snapcolls);
-  void _upgrade_v7(ObjectStore *store, const interval_set<snapid_t> &snapcolls);
+  void upgrade(ObjectStore *store);
 
   const coll_t coll;
   PGLog  pg_log;
@@ -784,14 +781,14 @@ public:
   }
   bool is_acting(pg_shard_t osd) const {
     if (pool.info.ec_pool()) {
-      return acting.size() > osd.shard && acting[osd.shard] == osd.osd;
+      return acting.size() > (unsigned)osd.shard && acting[osd.shard] == osd.osd;
     } else {
       return std::find(acting.begin(), acting.end(), osd.osd) != acting.end();
     }
   }
   bool is_up(pg_shard_t osd) const {
     if (pool.info.ec_pool()) {
-      return up.size() > osd.shard && up[osd.shard] == osd.osd;
+      return up.size() > (unsigned)osd.shard && up[osd.shard] == osd.osd;
     } else {
       return std::find(up.begin(), up.end(), osd.osd) != up.end();
     }
@@ -1212,7 +1209,6 @@ public:
     const std::map<hobject_t, pair<uint32_t, uint32_t> > &missing_digest) { }
   virtual void _scrub_clear_state() { }
   virtual void _scrub_finish() { }
-  virtual void get_colls(list<coll_t> *out) = 0;
   virtual void split_colls(
     spg_t child,
     int split_bits,
@@ -2012,14 +2008,24 @@ public:
   PG& operator=(const PG& rhs);
   const spg_t pg_id;
   uint64_t peer_features;
+  uint64_t acting_features;
+  uint64_t upacting_features;
 
  public:
   const spg_t&      get_pgid() const { return pg_id; }
   int        get_nrep() const { return acting.size(); }
 
-  void reset_peer_features() { peer_features = (uint64_t)-1; }
+  void reset_all_min_features() {
+     peer_features = CEPH_FEATURES_SUPPORTED_DEFAULT;
+     acting_features = CEPH_FEATURES_SUPPORTED_DEFAULT;
+     upacting_features = CEPH_FEATURES_SUPPORTED_DEFAULT;
+  }
   uint64_t get_min_peer_features() const { return peer_features; }
+  uint64_t get_min_acting_features() const { return acting_features; }
+  uint64_t get_min_upacting_features() const { return upacting_features; }
   void apply_peer_features(uint64_t f) { peer_features &= f; }
+  void apply_acting_features(uint64_t f) { acting_features &= f; }
+  void apply_upacting_features(uint64_t f) { upacting_features &= f; }
 
   void init_primary_up_acting(
     const vector<int> &newup,
@@ -2268,6 +2274,7 @@ public:
   virtual void get_watchers(std::list<obj_watch_item_t>&) = 0;
 
   virtual bool agent_work(int max) = 0;
+  virtual bool agent_work(int max, int agent_flush_quota) = 0;
   virtual void agent_stop() = 0;
   virtual void agent_delay() = 0;
   virtual void agent_clear() = 0;

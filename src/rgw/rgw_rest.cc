@@ -494,16 +494,28 @@ void dump_start(struct req_state *s)
   }
 }
 
+void dump_trans_id(req_state *s)
+{
+  if (s->prot_flags & RGW_REST_SWIFT) {
+    s->cio->print("X-Trans-Id: ts-%s\r\n", s->trans_id.c_str());
+  }
+  else {
+    s->cio->print("x-amz-request-id: %s\r\n", s->trans_id.c_str());
+  }
+}
+
 void end_header(struct req_state *s, RGWOp *op, const char *content_type, const int64_t proposed_content_length,
 		bool force_content_type)
 {
   string ctype;
 
+  dump_trans_id(s);
+
   if (op) {
     dump_access_control(s, op);
   }
 
-  if (s->prot_flags & RGW_REST_SWIFT) {
+  if (s->prot_flags & RGW_REST_SWIFT && !content_type) {
     force_content_type = true;
   }
 
@@ -804,7 +816,7 @@ int RGWPutObj_ObjStore::verify_params()
 {
   if (s->length) {
     off_t len = atoll(s->length);
-    if (len > (off_t)RGW_MAX_PUT_SIZE) {
+    if (len > (off_t)(s->cct->_conf->rgw_max_put_size)) {
       return -ERR_TOO_LARGE;
     }
   }
@@ -843,7 +855,7 @@ int RGWPutObj_ObjStore::get_data(bufferlist& bl)
     bl.append(bp, 0, len);
   }
 
-  if ((uint64_t)ofs + len > RGW_MAX_PUT_SIZE) {
+  if ((uint64_t)ofs + len > s->cct->_conf->rgw_max_put_size) {
     return -ERR_TOO_LARGE;
   }
 
@@ -862,7 +874,7 @@ int RGWPostObj_ObjStore::verify_params()
     return -ERR_LENGTH_REQUIRED;
   }
   off_t len = atoll(s->length);
-  if (len > (off_t)RGW_MAX_PUT_SIZE) {
+  if (len > (off_t)(s->cct->_conf->rgw_max_put_size)) {
     return -ERR_TOO_LARGE;
   }
 

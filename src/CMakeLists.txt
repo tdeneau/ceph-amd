@@ -355,14 +355,21 @@ install(FILES include/rados/librados.h
   DESTINATION include/rados)
 install(TARGETS librados DESTINATION lib)
 
+set(libradosstriper_srcs
+  libradosstriper/libradosstriper.cc
+  libradosstriper/RadosStriperImpl.cc
+  libradosstriper/MultiAioCompletionImpl.cc)
+add_library(libradosstriper ${libradosstriper_srcs})
+target_link_libraries(libradosstriper librados cls_lock_client)
+
 set(rados_srcs
   tools/rados/rados.cc
-  tools/rados/rados_sync.cc
-  tools/rados/rados_import.cc
-  tools/rados/rados_export.cc
+  tools/RadosDump.cc
+  tools/rados/RadosImport.cc
+  tools/rados/PoolDump.cc
   common/obj_bencher.cc)
 add_executable(rados ${rados_srcs} $<TARGET_OBJECTS:heap_profiler_objs>)
-target_link_libraries(rados librados global ${CMAKE_DL_LIBS} ${TCMALLOC_LIBS})
+target_link_libraries(rados librados global ${CMAKE_DL_LIBS} ${TCMALLOC_LIBS} libradosstriper)
 
 set(librados_config_srcs
   librados-config.cc)
@@ -779,7 +786,8 @@ if(${WITH_RADOSGW})
     rgw/rgw_main.cc)
 
   set(radosgw_admin_srcs
-    rgw/rgw_admin.cc)
+    rgw/rgw_admin.cc
+    rgw/rgw_orphan.cc)
 
   add_executable(radosgw ${radosgw_srcs} $<TARGET_OBJECTS:heap_profiler_objs>)
   target_link_libraries(radosgw rgw_a librados

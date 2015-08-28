@@ -53,9 +53,11 @@ private:
   // OSDMap full status, used to generate ENOSPC on some operations
   bool is_full;
 
-public:
+  // State for while in reconnect
+  MDSInternalContext *reconnect_done;
   int failed_reconnects;
 
+public:
   bool terminating_sessions;
 
   Server(MDS *m) : 
@@ -64,12 +66,14 @@ public:
     messenger(mds->messenger),
     logger(0),
     is_full(false),
+    reconnect_done(NULL),
     failed_reconnects(0),
     terminating_sessions(false) {
   }
   ~Server() {
     g_ceph_context->get_perfcounters_collection()->remove(logger);
     delete logger;
+    delete reconnect_done;
   }
 
   void create_logger();
@@ -99,7 +103,7 @@ public:
   void find_idle_sessions();
   void kill_session(Session *session, Context *on_safe);
   void journal_close_session(Session *session, int state, Context *on_safe);
-  void reconnect_clients();
+  void reconnect_clients(MDSInternalContext *reconnect_done_);
   void handle_client_reconnect(class MClientReconnect *m);
   //void process_reconnect_cap(CInode *in, int from, ceph_mds_cap_reconnect& capinfo);
   void reconnect_gather_finish();
@@ -172,7 +176,7 @@ public:
   void handle_client_setdirlayout(MDRequestRef& mdr);
 
   int parse_layout_vxattr(string name, string value, const OSDMap *osdmap,
-			  ceph_file_layout *layout);
+			  ceph_file_layout *layout, bool validate=true);
   int parse_quota_vxattr(string name, string value, quota_info_t *quota);
   void handle_set_vxattr(MDRequestRef& mdr, CInode *cur,
 			 ceph_file_layout *dir_layout,

@@ -2263,6 +2263,17 @@ TEST(BufferList, zero) {
     bl.zero((unsigned)3, (unsigned)3);
     EXPECT_EQ(0, ::memcmp("ABC\0\0\0GHIKLM", bl.c_str(), 9));
   }
+  {
+    bufferlist bl;
+    bufferptr ptr1(4);
+    bufferptr ptr2(4);
+    memset(ptr1.c_str(), 'a', 4);
+    memset(ptr2.c_str(), 'b', 4);
+    bl.append(ptr1);
+    bl.append(ptr2);
+    bl.zero((unsigned)2, (unsigned)4);
+    EXPECT_EQ(0, ::memcmp("aa\0\0\0\0bb", bl.c_str(), 8));
+  }
 }
 
 TEST(BufferList, EmptyAppend) {
@@ -2372,6 +2383,46 @@ TEST(BufferList, TestCopyAll) {
       (unsigned char*)malloc(BIG_SZ), free);
   bl2.copy(0, BIG_SZ, (char*)big2.get());
   ASSERT_EQ(memcmp(big.get(), big2.get(), BIG_SZ), 0);
+}
+
+TEST(BufferList, InvalidateCrc) {
+  const static size_t buffer_size = 262144;
+  ceph::shared_ptr <unsigned char> big(
+      (unsigned char*)malloc(buffer_size), free);
+  unsigned char c = 0;
+  char* ptr = (char*) big.get();
+  char* inptr;
+  for (size_t i = 0; i < buffer_size; ++i) {
+    ptr[i] = c++;
+  }
+  bufferlist bl;
+  
+  // test for crashes (shouldn't crash)
+  bl.invalidate_crc();
+  
+  // put data into bufferlist
+  bl.append((const char*)big.get(), buffer_size);
+  
+  // get its crc
+  __u32 crc = bl.crc32c(0);
+  
+  // modify data in bl without its knowledge
+  inptr = (char*) bl.c_str();
+  c = 0;
+  for (size_t i = 0; i < buffer_size; ++i) {
+    inptr[i] = c--;
+  }
+  
+  // make sure data in bl are now different than in big
+  EXPECT_NE(memcmp((void*) ptr, (void*) inptr, buffer_size), 0);
+  
+  // crc should remain the same
+  __u32 new_crc = bl.crc32c(0);
+  EXPECT_EQ(crc, new_crc);
+  
+  // force crc invalidate, check if it is updated
+  bl.invalidate_crc();
+  EXPECT_NE(crc, bl.crc32c(0));
 }
 
 TEST(BufferHash, all) {

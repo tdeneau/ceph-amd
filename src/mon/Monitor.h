@@ -243,11 +243,47 @@ private:
    *
    * Verify all mons are storing identical content
    */
+  int scrub_start();
   int scrub();
   void handle_scrub(MMonScrub *m);
-  void _scrub(ScrubResult *r);
+  bool _scrub(ScrubResult *r,
+              pair<string,string> *start,
+              int *num_keys);
+  void scrub_check_results();
+  void scrub_timeout();
   void scrub_finish();
   void scrub_reset();
+  void scrub_update_interval(int secs);
+
+  struct C_Scrub : public Context {
+    Monitor *mon;
+    C_Scrub(Monitor *m) : mon(m) { }
+    void finish(int r) {
+      mon->scrub_start();
+    }
+  };
+  struct C_ScrubTimeout : public Context {
+    Monitor *mon;
+    C_ScrubTimeout(Monitor *m) : mon(m) { }
+    void finish(int r) {
+      mon->scrub_timeout();
+    }
+  };
+  Context *scrub_event;       ///< periodic event to trigger scrub (leader)
+  Context *scrub_timeout_event;  ///< scrub round timeout (leader)
+  void scrub_event_start();
+  void scrub_event_cancel();
+  void scrub_reset_timeout();
+  void scrub_cancel_timeout();
+
+  struct ScrubState {
+    pair<string,string> last_key; ///< last scrubbed key
+    bool finished;
+
+    ScrubState() : finished(false) { }
+    virtual ~ScrubState() { }
+  };
+  ceph::shared_ptr<ScrubState> scrub_state; ///< keeps track of current scrub
 
   /**
    * @defgroup Monitor_h_sync Synchronization
@@ -946,10 +982,11 @@ struct MonCommand {
   uint64_t flags;
 
   // MonCommand flags
-  enum {
-    FLAG_NOFORWARD = (1 << 0),
-  };
-
+  static const uint64_t FLAG_NONE       = 0;
+  static const uint64_t FLAG_NOFORWARD  = 1 << 0;
+  static const uint64_t FLAG_OBSOLETE   = 1 << 1;
+  static const uint64_t FLAG_DEPRECATED = 1 << 2;
+  
   bool has_flag(uint64_t flag) const { return (flags & flag) != 0; }
   void set_flag(uint64_t flag) { flags |= flag; }
   void unset_flag(uint64_t flag) { flags &= ~flag; }
@@ -974,9 +1011,21 @@ struct MonCommand {
     ::decode(availability, bl);
   }
   bool is_compat(const MonCommand* o) const {
-    return cmdstring == o->cmdstring && helpstring == o->helpstring &&
+    return cmdstring == o->cmdstring &&
 	module == o->module && req_perms == o->req_perms &&
 	availability == o->availability;
+  }
+
+  bool is_noforward() const {
+    return has_flag(MonCommand::FLAG_NOFORWARD);
+  }
+
+  bool is_obsolete() const {
+    return has_flag(MonCommand::FLAG_OBSOLETE);
+  }
+
+  bool is_deprecated() const {
+    return has_flag(MonCommand::FLAG_DEPRECATED);
   }
 
   static void encode_array(const MonCommand *cmds, int size, bufferlist &bl) {
