@@ -762,9 +762,13 @@ int ObjBencher::rand_read_bench(int seconds_to_run, int num_objects, int concurr
     return r;
 
   //set up initial reads
+  int num_init_reads = concurrentios;  // assume no problem
   for (int i = 0; i < concurrentios; ++i) {
     name[i] = generate_object_name(i, pid);
-    if (name[i].length() == 0) break;
+    if (name[i].length() == 0) {
+      num_init_reads = i;
+      break;
+    }
     contents[i] = new bufferlist();
   }
 
@@ -778,7 +782,8 @@ int ObjBencher::rand_read_bench(int seconds_to_run, int num_objects, int concurr
 
   utime_t finish_time = data.start_time + time_to_run;
   //start initial reads
-  for (int i = 0; i < concurrentios; ++i) {
+  for (int i = 0; i < num_init_reads; ++i) {
+    if (name[i].length() == 0) break;
     index[i] = i;
     start_times[i] = ceph_clock_now(g_ceph_context);
     create_completion(i, _aio_cb, (void *)&lc);
