@@ -13,6 +13,9 @@
 #include "osdc/ObjectCacher.h"
 #include "include/assert.h"
 
+#include "InodeRef.h"
+
+class Client;
 struct MetaSession;
 class Dentry;
 class Dir;
@@ -42,7 +45,7 @@ struct Cap {
 
 struct CapSnap {
   //snapid_t follows;  // map key
-  Inode *in;
+  InodeRef in;
   SnapContext context;
   int issued, dirty;
 
@@ -151,11 +154,13 @@ public:
 #define I_DIR_ORDERED 2
 
 struct Inode {
-  CephContext *cct;
+  Client *client;
 
   // -- the actual inode --
   inodeno_t ino;
   snapid_t  snapid;
+  ino_t faked_ino;
+
   uint32_t   rdev;    // if special file
 
   // affected by any inode change...
@@ -230,17 +235,15 @@ struct Inode {
   map<mds_rank_t, Cap*> caps;            // mds -> Cap
   Cap *auth_cap;
   unsigned dirty_caps, flushing_caps;
-  uint64_t flushing_cap_seq;
-  __u16 flushing_cap_tid[CEPH_CAP_BITS];
+  std::map<ceph_tid_t, int> flushing_cap_tids;
   int shared_gen, cache_gen;
   int snap_caps, snap_cap_refs;
   utime_t hold_caps_until;
   xlist<Inode*>::item cap_item, flushing_cap_item;
-  ceph_tid_t last_flush_tid;
 
   SnapRealm *snaprealm;
   xlist<Inode*>::item snaprealm_item;
-  Inode *snapdir_parent;  // only if we are a snapdir inode
+  InodeRef snapdir_parent;  // only if we are a snapdir inode
   map<snapid_t,CapSnap*> cap_snaps;   // pending flush to mds
 
   //int open_by_mode[CEPH_FILE_MODE_NUM];
@@ -271,19 +274,8 @@ struct Inode {
   void make_long_path(filepath& p);
   void make_nosnap_relative_path(filepath& p);
 
-  void get() {
-    _ref++;
-    lsubdout(cct, mds, 15) << "inode.get on " << this << " " <<  ino << '.' << snapid
-                           << " now " << _ref << dendl;
-  }
-  /// private method to put a reference; see Client::put_inode()
-  int _put(int n=1) {
-    _ref -= n; 
-    lsubdout(cct, mds, 15) << "inode.put on " << this << " " << ino << '.' << snapid
-                           << " now " << _ref << dendl;
-    assert(_ref >= 0);
-    return _ref;
-  }
+  void get();
+  int _put(int n=1);
 
   int get_num_ref() {
     return _ref;
@@ -303,8 +295,8 @@ struct Inode {
 
   xlist<MetaRequest*> unsafe_dir_ops;
 
-  Inode(CephContext *cct_, vinodeno_t vino, ceph_file_layout *newlayout)
-    : cct(cct_), ino(vino.ino), snapid(vino.snapid),
+  Inode(Client *c, vinodeno_t vino, ceph_file_layout *newlayout)
+    : client(c), ino(vino.ino), snapid(vino.snapid), faked_ino(0),
       rdev(0), mode(0), uid(0), gid(0), nlink(0),
       size(0), truncate_seq(1), truncate_size(-1),
       time_warp_seq(0), max_size(0), version(0), xattr_version(0),
@@ -312,10 +304,10 @@ struct Inode {
       flags(0),
       qtree(NULL),
       dir_hashed(false), dir_replicated(false), auth_cap(NULL),
-      dirty_caps(0), flushing_caps(0), flushing_cap_seq(0), shared_gen(0), cache_gen(0),
+      dirty_caps(0), flushing_caps(0), shared_gen(0), cache_gen(0),
       snap_caps(0), snap_cap_refs(0),
-      cap_item(this), flushing_cap_item(this), last_flush_tid(0),
-      snaprealm(0), snaprealm_item(this), snapdir_parent(0),
+      cap_item(this), flushing_cap_item(this),
+      snaprealm(0), snaprealm_item(this),
       oset((void *)this, newlayout->fl_pg_pool, ino),
       reported_size(0), wanted_max_size(0), requested_max_size(0),
       _ref(0), ll_ref(0), dir(0), dn_set(),
@@ -324,7 +316,6 @@ struct Inode {
   {
     memset(&dir_layout, 0, sizeof(dir_layout));
     memset(&layout, 0, sizeof(layout));
-    memset(&flushing_cap_tid, 0, sizeof(__u16)*CEPH_CAP_BITS);
     memset(&quota, 0, sizeof(quota));
   }
   ~Inode() { }

@@ -298,7 +298,7 @@ function run_mon() {
         --mon-data-avail-crit=1 \
         --paxos-propose-interval=0.1 \
         --osd-crush-chooseleaf-type=0 \
-        --osd-pool-default-erasure-code-directory=.libs \
+        --erasure-code-dir=.libs \
         --debug-mon 20 \
         --debug-ms 20 \
         --debug-paxos 20 \
@@ -422,7 +422,6 @@ function test_run_osd() {
     run_osd $dir 0 || return 1
     local backfills=$(CEPH_ARGS='' ceph --format=json daemon $dir//ceph-osd.0.asok \
         config get osd_max_backfills)
-    test "$backfills" = '{"osd_max_backfills":"10"}' || return 1
 
     run_osd $dir 1 --osd-max-backfills 20 || return 1
     local backfills=$(CEPH_ARGS='' ceph --format=json daemon $dir//ceph-osd.1.asok \
@@ -493,7 +492,7 @@ function activate_osd() {
     ceph_args+=" --osd-journal-size=100"
     ceph_args+=" --osd-data=$osd_data"
     ceph_args+=" --chdir="
-    ceph_args+=" --osd-pool-default-erasure-code-directory=.libs"
+    ceph_args+=" --erasure-code-dir=.libs"
     ceph_args+=" --osd-class-dir=.libs"
     ceph_args+=" --run-dir=$dir"
     ceph_args+=" --debug-osd=20"
@@ -524,7 +523,6 @@ function test_activate_osd() {
     run_osd $dir 0 || return 1
     local backfills=$(CEPH_ARGS='' ceph --format=json daemon $dir//ceph-osd.0.asok \
         config get osd_max_backfills)
-    test "$backfills" = '{"osd_max_backfills":"10"}' || return 1
 
     kill_daemons $dir TERM osd || return 1
 

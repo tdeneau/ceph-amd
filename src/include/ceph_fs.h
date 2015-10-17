@@ -246,6 +246,7 @@ struct ceph_mon_subscribe_ack {
 #define CEPH_MDS_STATE_STARTING    -7  /* up, starting previously stopped mds */
 #define CEPH_MDS_STATE_STANDBY_REPLAY -8 /* up, tailing active node's journal */
 #define CEPH_MDS_STATE_REPLAYONCE   -9 /* up, replaying an active node's journal */
+#define CEPH_MDS_STATE_NULL         -10
 
 #define CEPH_MDS_STATE_REPLAY       8  /* up, replaying journal. */
 #define CEPH_MDS_STATE_RESOLVE      9  /* up, disambiguating distributed
@@ -408,6 +409,7 @@ union ceph_mds_request_args {
 	} __attribute__ ((packed)) open;
 	struct {
 		__le32 flags;
+		__le32 osdmap_epoch; 	    /* use for set file/dir layout */
 	} __attribute__ ((packed)) setxattr;
 	struct {
 		struct ceph_file_layout layout;

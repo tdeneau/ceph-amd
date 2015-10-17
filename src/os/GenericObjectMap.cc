@@ -133,7 +133,7 @@ string GenericObjectMap::header_key(const coll_t &cid, const ghobject_t &oid)
 
   t = buf;
   snprintf(t, end - t, "%.*X", (int)(sizeof(oid.hobj.get_hash())*2),
-           (uint32_t)oid.get_filestore_key_u32());
+           (uint32_t)oid.hobj.get_bitwise_key_u32());
   full_name += string(buf);
   full_name.append(GHOBJECT_KEY_SEP_S);
 
@@ -157,7 +157,6 @@ string GenericObjectMap::header_key(const coll_t &cid, const ghobject_t &oid)
   full_name += string(buf);
 
   if (oid.generation != ghobject_t::NO_GEN) {
-    assert(oid.shard_id != shard_id_t::NO_SHARD);
     full_name.append(GHOBJECT_KEY_SEP_S);
 
     t = buf;
@@ -262,10 +261,10 @@ bool GenericObjectMap::parse_header_key(const string &long_name,
   }
 
   if (out) {
-    (*out) = ghobject_t(hobject_t(name, key, snap, hash, (int64_t)pool, ns),
+    (*out) = ghobject_t(hobject_t(name, key, snap,
+				  hobject_t::_reverse_bits(hash),
+				  (int64_t)pool, ns),
                         generation, shard_id);
-    // restore reversed hash. see calculate_key
-    out->hobj.set_hash(out->get_filestore_key());
   }
 
   if (out_coll) {
@@ -534,6 +533,7 @@ int GenericObjectMap::clear(const Header header,
 
 int GenericObjectMap::rm_keys(const Header header,
                               const string &prefix,
+                              const set<string> &buffered_keys,
                               const set<string> &to_clear,
                               KeyValueDB::Transaction t)
 {
@@ -563,7 +563,7 @@ int GenericObjectMap::rm_keys(const Header header,
         begin = new_complete.rbegin()->first;
       }
       while (iter->valid() && copied < 20) {
-        if (!to_clear.count(iter->key()))
+        if (!to_clear.count(iter->key()) && !buffered_keys.count(iter->key()))
           to_write[iter->key()].append(iter->value());
         if (i != to_clear.end() && *i <= iter->key()) {
           ++i;
@@ -692,6 +692,7 @@ void GenericObjectMap::clone(const Header parent, const coll_t &cid,
   // to find parent header. So it will let lookup_parent fail when "clone" and
   // "rm_keys" in one transaction. Here have to sync transaction to make
   // visiable for lookup_parent
+  // FIXME: Clear transaction operations here
   int r = submit_transaction_sync(t);
   assert(r == 0);
 }
@@ -1047,7 +1048,7 @@ void GenericObjectMap::set_header(const coll_t &cid, const ghobject_t &oid,
   t->set(GHOBJECT_TO_SEQ_PREFIX, to_set);
 }
 
-int GenericObjectMap::list_objects(const coll_t &cid, ghobject_t start, int max,
+int GenericObjectMap::list_objects(const coll_t &cid, ghobject_t start, ghobject_t end, int max,
                                    vector<ghobject_t> *out, ghobject_t *next)
 {
   // FIXME
@@ -1099,7 +1100,14 @@ int GenericObjectMap::list_objects(const coll_t &cid, ghobject_t start, int max,
       break;
     }
 
-    assert(start <= header.oid);
+    if (cmp_bitwise(header.oid, end) >= 0) {
+      if (next)
+	*next = ghobject_t::get_max();
+      break;
+    }
+
+    assert(cmp_bitwise(start, header.oid) <= 0);
+    assert(cmp_bitwise(header.oid, end) < 0);
 
 
     size++;

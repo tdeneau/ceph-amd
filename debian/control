@@ -4,12 +4,14 @@ Priority: optional
 Homepage: http://ceph.com/
 Vcs-Git: git://github.com/ceph/ceph.git
 Vcs-Browser: https://github.com/ceph/ceph
-Maintainer: Laszlo Boszormenyi (GCS) <gcs@debian.hu>
-Uploaders: Sage Weil <sage@newdream.net>
+Maintainer: Ceph Maintainers <ceph-maintainers@lists.ceph.com>
+Uploaders: Ken Dreyer <kdreyer@redhat.com>,
+           Alfredo Deza <adeza@redhat.com>
 Build-Depends: autoconf,
                automake,
                autotools-dev,
 	       libbz2-dev,
+	       cmake,
 	       cryptsetup-bin | cryptsetup,
                debhelper (>= 6.0.7~),
                default-jdk,
@@ -26,6 +28,8 @@ Build-Depends: autoconf,
                libboost-program-options-dev (>= 1.42),
                libboost-system-dev (>= 1.42),
                libboost-thread-dev (>= 1.42),
+	       libboost-regex-dev,
+	       libboost-random-dev,
                libcurl4-gnutls-dev,
                libedit-dev,
                libexpat1-dev,
@@ -46,10 +50,10 @@ Build-Depends: autoconf,
                python (>= 2.6.6-3~),
                python-argparse,
                python-nose,
+	       python-setuptools,
                python-sphinx,
                python-virtualenv,
                sdparm | hdparm,
-               uuid-dev,
                uuid-runtime,
                xfslibs-dev,
                xfsprogs,
@@ -72,7 +76,6 @@ Depends: binutils,
          python,
          python-argparse,
          sdparm | hdparm,
-         uuid-runtime,
          xfsprogs,
 	 python-flask,
          ${misc:Depends},
@@ -197,9 +200,11 @@ Depends: librbd1 (= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends},
 Conflicts: ceph-client-tools
 Replaces: ceph-client-tools,
 	  ceph (<< 9.0.0-943),
+	  ceph-test (<< 9.0.3-1646),
 	  python-ceph (<< 0.92-1223),
 	  librbd1 (<< 0.92-1238)
 Breaks: ceph (<< 9.0.0-943),
+	ceph-test (<< 9.0.3-1646),
 	python-ceph (<< 0.92-1223),
 	librbd1 (<< 0.92-1238)
 Suggests: ceph, ceph-mds
@@ -448,23 +453,6 @@ Description: debugging symbols for radosgw
  service.
  .
  This package contains debugging symbols for radosgw.
-
-Package: rest-bench
-Architecture: linux-any
-Depends: ceph-common, curl, xml2, ${misc:Depends}, ${shlibs:Depends}
-Description: RESTful bencher that can be used to benchmark
- radosgw performance.
-
-Package: rest-bench-dbg
-Architecture: linux-any
-Section: debug
-Priority: extra
-Depends: rest-bench (= ${binary:Version}), ceph-common, curl, xml2,
-          ${misc:Depends}, ${shlibs:Depends}
-Description: debugging symbols for rest-bench
- radosgw performance.
- .
- This package contains the debugging symbols for rest-bench.
 
 Package: ceph-test
 Architecture: linux-any

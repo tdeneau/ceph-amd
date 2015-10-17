@@ -134,6 +134,7 @@ protected:
   int ret;
   bool get_data;
   bool partial_content;
+  bool range_parsed;
   rgw_obj obj;
   utime_t gc_invalidate_time;
 
@@ -156,10 +157,11 @@ public:
     unmod_ptr = NULL;
     get_data = false;
     partial_content = false;
+    range_parsed = false;
     ret = 0;
  }
 
-  virtual bool prefetch_data() { return get_data; }
+  bool prefetch_data();
 
   void set_get_data(bool get_data) {
     this->get_data = get_data;
@@ -178,6 +180,7 @@ public:
   virtual const string name() { return "get_obj"; }
   virtual RGWOpType get_type() { return RGW_OP_GET_OBJ; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
+  virtual bool need_object_expiration() { return false; }
 };
 
 #define RGW_LIST_BUCKETS_LIMIT_MAX 10000
@@ -256,6 +259,7 @@ protected:
   rgw_obj_key end_marker;
   string max_keys;
   string delimiter;
+  string encoding_type;
   bool list_versions;
   int max;
   int ret;
@@ -432,6 +436,8 @@ protected:
   uint64_t olh_epoch;
   string version_id;
 
+  time_t delete_at;
+
 public:
   RGWPutObj() {
     ret = 0;
@@ -445,6 +451,7 @@ public:
     mtime = 0;
     user_manifest_parts_hash = NULL;
     olh_epoch = 0;
+    delete_at = 0;
   }
 
   virtual void init(RGWRados *store, struct req_state *s, RGWHandler *h) {
@@ -485,11 +492,12 @@ protected:
   string content_type;
   RGWAccessControlPolicy policy;
   map<string, bufferlist> attrs;
+  time_t delete_at;
 
 public:
   RGWPostObj() : min_len(0), max_len(LLONG_MAX), ret(0), len(0), ofs(0),
 		 supplied_md5_b64(NULL), supplied_etag(NULL),
-		 data_pending(false) {}
+		 data_pending(false), delete_at(0) {}
 
   virtual void init(RGWRados *store, struct req_state *s, RGWHandler *h) {
     RGWOp::init(store, s, h);
@@ -575,10 +583,11 @@ protected:
   int ret;
   RGWAccessControlPolicy policy;
   string placement_rule;
+  time_t delete_at;
 
 public:
   RGWPutMetadataObject()
-    : ret(0)
+    : ret(0), delete_at(0)
   {}
 
   virtual void init(RGWRados *store, struct req_state *s, RGWHandler *h) {
@@ -594,6 +603,7 @@ public:
   virtual const string name() { return "put_obj_metadata"; }
   virtual RGWOpType get_type() { return RGW_OP_PUT_METADATA_OBJECT; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
+  virtual bool need_object_expiration() { return false; }
 };
 
 class RGWDeleteObj : public RGWOp {
@@ -652,6 +662,7 @@ protected:
   string version_id;
   uint64_t olh_epoch;
 
+  time_t delete_at;
 
   int init_common();
 
@@ -674,6 +685,7 @@ public:
     attrs_mod = RGWRados::ATTRSMOD_NONE;
     last_ofs = 0;
     olh_epoch = 0;
+    delete_at = 0;
   }
 
   static bool parse_copy_location(const string& src, string& bucket_name, rgw_obj_key& object);

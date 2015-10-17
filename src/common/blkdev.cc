@@ -1,3 +1,14 @@
+/*
+ * Ceph - scalable distributed file system
+ *
+ * Copyright (c) 2015 Hewlett-Packard Development Company, L.P.
+ *
+ * This is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License version 2.1, as published by the Free Software 
+ * Foundation.  See file COPYING.
+ * 
+ */
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
@@ -8,10 +19,10 @@
 #include <dirent.h>
 #include <stdlib.h>
 #include "include/int_types.h"
+#include "include/uuid.h"
 
 #ifdef __linux__
 #include <linux/fs.h>
-#include "include/uuid.h"
 #include <blkid/blkid.h>
 
 #define UUID_LEN 36
@@ -176,25 +187,33 @@ int get_device_by_uuid(uuid_d dev_uuid, const char* label, char* partition,
   blkid_dev dev = NULL;
   int rc = 0;
 
-  uuid_unparse((const unsigned char*)&dev_uuid.uuid, uuid_str);
+  dev_uuid.print(uuid_str);
 
   if (blkid_get_cache(&cache, NULL) >= 0)
     dev = blkid_find_dev_with_tag(cache, label, (const char*)uuid_str);
+  else
+    rc = -EINVAL;
 
   if (dev) {
     temp_partition_ptr = blkid_dev_devname(dev);
     strncpy(partition, temp_partition_ptr, PATH_MAX);
     rc = get_block_device_base(partition, basename,
       sizeof(basename));
-    if (rc >= 0)
+    if (rc >= 0) {
       strncpy(device, basename, sizeof(basename));
-    else
-      return -ENODEV;
-
-    return 0;
+      rc = 0;
+    } else {
+      rc = -ENODEV;
+    }
+  } else {
+    rc = -EINVAL;
   }
 
-  return -EINVAL;
+  /* From what I can tell, blkid_put_cache cleans up dev, which
+   * appears to be a pointer into cache, as well */
+  if (cache)
+    blkid_put_cache(cache);
+  return rc;
 }
 #elif defined(__APPLE__)
 #include <sys/disk.h>

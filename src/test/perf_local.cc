@@ -381,6 +381,7 @@ double cond_ping_pong()
 // probably pick worse values.
 double div32()
 {
+#if defined(__i386__) || defined(__x86_64__)
   int count = 1000000;
   uint64_t start = Cycles::rdtsc();
   // NB: Expect an x86 processor exception is there's overflow.
@@ -397,6 +398,9 @@ double div32()
   }
   uint64_t stop = Cycles::rdtsc();
   return Cycles::to_seconds(stop - start)/count;
+#else
+  return -1;
+#endif
 }
 
 // Measure the cost of a 64-bit divide. Divides don't take a constant
@@ -520,6 +524,9 @@ double memcpy_shared(size_t size)
 {
   int count = 1000000;
   char src[size], dst[size];
+
+  memset(src, 0, sizeof(src));
+
   uint64_t start = Cycles::rdtsc();
   for (int i = 0; i < count; i++) {
     memcpy(dst, src, size);
@@ -659,6 +666,7 @@ double perf_prefetch()
 #endif
 }
 
+#if defined(__x86_64__)
 /**
  * This function is used to seralize machine instructions so that no
  * instructions that appear after it in the current thread can run before any
@@ -674,9 +682,11 @@ static inline void serialize() {
         : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
         : "a" (1U));
 }
+#endif
 
 // Measure the cost of cpuid
 double perf_serialize() {
+#if defined(__x86_64__)
   int count = 1000000;
   uint64_t start = Cycles::rdtsc();
   for (int i = 0; i < count; i++) {
@@ -684,6 +694,9 @@ double perf_serialize() {
   }
   uint64_t stop = Cycles::rdtsc();
   return Cycles::to_seconds(stop - start)/count;
+#else
+  return -1;
+#endif
 }
 
 // Measure the cost of an lfence instruction.
@@ -775,7 +788,7 @@ double perf_timer()
     timer.cancel_event(c[i]);
   }
   uint64_t stop = Cycles::rdtsc();
-  delete c;
+  delete[] c;
   return Cycles::to_seconds(stop - start)/count;
 }
 

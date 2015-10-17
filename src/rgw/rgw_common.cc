@@ -99,7 +99,7 @@ is_err() const
 
 
 req_info::req_info(CephContext *cct, class RGWEnv *e) : env(e) {
-  method = env->get("REQUEST_METHOD");
+  method = env->get("REQUEST_METHOD", "");
   script_uri = env->get("SCRIPT_URI", cct->_conf->rgw_script_uri.c_str());
   request_uri = env->get("REQUEST_URI", cct->_conf->rgw_request_uri.c_str());
   int pos = request_uri.find('?');
@@ -109,7 +109,7 @@ req_info::req_info(CephContext *cct, class RGWEnv *e) : env(e) {
   } else {
     request_params = env->get("QUERY_STRING", "");
   }
-  host = env->get("HTTP_HOST");
+  host = env->get("HTTP_HOST", "");
 
   // strip off any trailing :port from host (added by CrossFTP and maybe others)
   size_t colon_offset = host.find_last_of(':');
@@ -182,18 +182,6 @@ req_state::~req_state() {
   delete formatter;
   delete bucket_acl;
   delete object_acl;
-}
-
-void req_state::gen_trans_id()
-{
-  char buf[256];
-  timeval timetest;
-  gettimeofday(&timetest, NULL);
-  if (strftime(buf, sizeof(buf), "%Y%m%d:%H%M%S",gmtime(&(timetest.tv_sec))) ==  0)
-    return;
-
-  snprintf(buf + strlen(buf), sizeof(buf)-strlen(buf) ,":%03ld", timetest.tv_usec/1000);
-  trans_id = req_id + "-" + buf;
 }
 
 struct str_len {
@@ -369,18 +357,17 @@ bool parse_iso8601(const char *s, struct tm *t)
   }
   string str;
   trim_whitespace(p, str);
-  if (str.size() == 1 && str[0] == 'Z')
+  int len = str.size();
+
+  if (len == 1 && str[0] == 'Z')
     return true;
 
-  if (str.size() != 5) {
-    return false;
-  }
   if (str[0] != '.' ||
-      str[str.size() - 1] != 'Z')
+      str[len - 1] != 'Z')
     return false;
 
   uint32_t ms;
-  int r = stringtoul(str.substr(1, 3), &ms);
+  int r = stringtoul(str.substr(1, len - 2), &ms);
   if (r < 0)
     return false;
 
@@ -431,9 +418,6 @@ void calc_hmac_sha1(const char *key, int key_len,
   HMACSHA1 hmac((const unsigned char *)key, key_len);
   hmac.Update((const unsigned char *)msg, msg_len);
   hmac.Final((unsigned char *)dest);
-  
-  char hex_str[(CEPH_CRYPTO_HMACSHA1_DIGESTSIZE * 2) + 1];
-  buf_to_hex((unsigned char *)dest, CEPH_CRYPTO_HMACSHA1_DIGESTSIZE, hex_str);
 }
 
 int gen_rand_base64(CephContext *cct, char *dest, int size) /* size should be the required string size + 1 */
@@ -456,7 +440,7 @@ int gen_rand_base64(CephContext *cct, char *dest, int size) /* size should be th
   }
   tmp_dest[ret] = '\0';
   memcpy(dest, tmp_dest, size);
-  dest[size] = '\0';
+  dest[size-1] = '\0';
 
   return 0;
 }
@@ -547,6 +531,26 @@ int gen_rand_alphanumeric_no_underscore(CephContext *cct, char *dest, int size) 
   for (i=0; i<size - 1; i++) {
     int pos = (unsigned)dest[i];
     dest[i] = alphanum_no_underscore_table[pos & 63];
+  }
+  dest[i] = '\0';
+
+  return 0;
+}
+
+static const char alphanum_plain_table[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+int gen_rand_alphanumeric_plain(CephContext *cct, char *dest, int size) /* size should be the required string size + 1 */
+{
+  int ret = get_random_bytes(dest, size);
+  if (ret < 0) {
+    lderr(cct) << "cannot get random bytes: " << cpp_strerror(-ret) << dendl;
+    return ret;
+  }
+
+  int i;
+  for (i=0; i<size - 1; i++) {
+    int pos = (unsigned)dest[i];
+    dest[i] = alphanum_plain_table[pos % (sizeof(alphanum_plain_table) - 1)];
   }
   dest[i] = '\0';
 

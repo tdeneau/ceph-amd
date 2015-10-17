@@ -69,6 +69,8 @@ void usage(ostream& out)
 "   cppool <pool-name> <dest-pool>   copy content of a pool\n"
 "   rmpool <pool-name> [<pool-name> --yes-i-really-really-mean-it]\n"
 "                                    remove pool <pool-name>'\n"
+"   purge <pool-name> --yes-i-really-really-mean-it\n"
+"                                    remove all objects from pool <pool-name> without removing it\n"
 "   df                               show per-pool and total usage\n"
 "   ls                               list objects in pool\n\n"
 "   chown 123                        change the pool owner to auid 123\n"
@@ -113,7 +115,7 @@ void usage(ostream& out)
 "   setomapheader <obj-name> <val>\n"
 "   tmap-to-omap <obj-name>          convert tmap keys/values to omap\n"
 "   watch <obj-name>                 add watcher on this object\n"
-"   notify <obj-name> <message>      notify wather of this object with message\n"
+"   notify <obj-name> <message>      notify watcher of this object with message\n"
 "   listwatchers <obj-name>          list the watchers of this object\n"
 "   set-alloc-hint <obj-name> <expected-object-size> <expected-write-size>\n"
 "                                    set allocation hint for an object\n"
@@ -195,11 +197,12 @@ void usage(ostream& out)
 "   --num-objects                    total number of objects\n"
 "   --min-object-size                min object size\n"
 "   --max-object-size                max object size\n"
-"   --min-ops                        min number of operations\n"
+"   --min-op-len                     min io size of operations\n"
+"   --max-op-len                     max io size of operations\n"
 "   --max-ops                        max number of operations\n"
-"   --max-backlog                    max backlog (in MB)\n"
-"   --percent                        percent of operations that are read\n"
-"   --target-throughput              target throughput (in MB)\n"
+"   --max-backlog                    max backlog size\n"
+"   --read-percent                   percent of operations that are read\n"
+"   --target-throughput              target throughput (in bytes)\n"
 "   --run-length                     total time (in seconds)\n"
     ;
 }
@@ -539,7 +542,7 @@ public:
     LoadGen *lg;
     librados::AioCompletion *completion;
 
-    LoadGenOp() {}
+    LoadGenOp() : id(0), type(0), off(0), len(0), lg(NULL), completion(NULL) {}
     LoadGenOp(LoadGen *_lg) : id(0), type(0), off(0), len(0), lg(_lg), completion(NULL) {}
   };
 
@@ -587,7 +590,7 @@ public:
     min_op_len = 1024;
     target_throughput = 5 * 1024 * 1024; // B/sec
     max_op_len = 2 * 1024 * 1024;
-    max_ops = 0; 
+    max_ops = 16; 
     max_backlog = target_throughput * 2;
     run_length = 60;
 
@@ -917,7 +920,7 @@ protected:
     return completions[slot]->get_return_value();
   }
 
-  bool get_objects(std::list<std::string>* objects, int num) {
+  bool get_objects(std::list<Object>* objects, int num) {
     int count = 0;
 
     if (!iterator_valid) {
@@ -934,7 +937,8 @@ protected:
 
     objects->clear();
     for ( ; oi != ei && count < num; ++oi) {
-      objects->push_back(oi->get_oid());
+      Object obj(oi->get_oid(), oi->get_nspace());
+      objects->push_back(obj);
       ++count;
     }
 
@@ -963,6 +967,10 @@ protected:
     } else {
       out(cout) << "Object prefix: Using name file \"" << name_file << "\"\n";
     }
+  }
+
+  void set_namespace( const std::string& ns) {
+    io_ctx.set_namespace(ns);
   }
 
 public:
@@ -1266,6 +1274,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
 
   Formatter *formatter = NULL;
   bool pretty_format = false;
+  const char *output = NULL;
 
   Rados rados;
   IoCtx io_ctx;
@@ -1422,6 +1431,10 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
   if (i != opts.end()) {
     no_verify = true;
   }
+  i = opts.find("output");
+  if (i != opts.end()) {
+    output = i->second.c_str();
+  }
 
 
   // open rados
@@ -1567,7 +1580,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       librados::pool_stat_t& s = i->second;
       if (!formatter) {
 	printf("%-15s "
-	       "%12lld %12lld %12lld %12lld"
+	       "%12lld %12lld %12lld %12lld "
 	       "%12lld %12lld %12lld %12lld %12lld\n",
 	       pool_name,
 	       (long long)s.num_kb,
@@ -2343,6 +2356,32 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       cerr << "pool " << nargs[1] << " could not be removed" << std::endl;
     }
   }
+  else if (strcmp(nargs[0], "purge") == 0) {
+    if (nargs.size() < 2)
+      usage_exit();
+    if (nargs.size() < 3 ||
+	strcmp(nargs[2], "--yes-i-really-really-mean-it") != 0) {
+      cerr << "WARNING:\n"
+	   << "  This will PERMANENTLY DESTROY all objects from a pool with no way back.\n"
+	   << "  To confirm, follow pool with --yes-i-really-really-mean-it" << std::endl;
+      ret = -1;
+      goto out;
+    }
+    ret = rados.ioctx_create(nargs[1], io_ctx);
+    if (ret < 0) {
+      cerr << "error pool " << nargs[1] << ": "
+	   << cpp_strerror(ret) << std::endl;
+      goto out;
+    }
+    io_ctx.set_namespace(all_nspaces);
+    RadosBencher bencher(g_ceph_context, rados, io_ctx, name_file);
+    ret = bencher.clean_up_slow("", concurrent_ios);
+    if (ret >= 0) {
+      cout << "successfully purged pool " << nargs[1] << std::endl;
+    } else { //error
+      cerr << "pool " << nargs[1] << " could not be purged" << std::endl;
+    }
+  }
   else if (strcmp(nargs[0], "lssnap") == 0) {
     if (!pool_name || nargs.size() != 1)
       usage_exit();
@@ -2442,12 +2481,29 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       ret = -EINVAL;
       goto out;
     }
+    if (!formatter && output) {
+      cerr << "-o|--output option can be used only with '--format' option"
+           << std::endl;
+      ret = -EINVAL;
+      goto out;
+    }
     RadosBencher bencher(g_ceph_context, rados, io_ctx, name_file);
     bencher.set_show_time(show_time);
+    ostream *outstream = NULL;
+    if (formatter) {
+      bencher.set_formatter(formatter);
+      if (output)
+        outstream = new ofstream(output);
+      else
+        outstream = &cout;
+      bencher.set_outstream(*outstream);
+    }
     ret = bencher.aio_bench(operation, seconds,
 			    concurrent_ios, op_size, cleanup, run_name, no_verify);
     if (ret != 0)
       cerr << "error during benchmark: " << ret << std::endl;
+    if (formatter && output)
+      delete outstream;
   }
   else if (strcmp(nargs[0], "cleanup") == 0) {
     if (!pool_name)
@@ -2964,6 +3020,8 @@ int main(int argc, const char **argv)
       opts["all"] = "true";
     } else if (ceph_argparse_flag(args, i, "--default", (char*)NULL)) {
       opts["default"] = "true";
+    } else if (ceph_argparse_witharg(args, i, &val, "-o", "--output", (char*)NULL)) {
+      opts["output"] = val;
     } else {
       if (val[0] == '-')
         usage_exit();

@@ -20,14 +20,22 @@ except ImportError:
             raise error
         return output
 
-import subprocess
+import filecmp
 import os
+import subprocess
+try:
+    from subprocess import DEVNULL
+except ImportError:
+    subprocess.DEVNULL = open(os.devnull, "w")
+
+import math
 import time
 import sys
 import re
 import string
 import logging
 import json
+import tempfile
 
 logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.WARNING)
 
@@ -134,49 +142,36 @@ def vstart(new, opt=""):
     print "DONE"
 
 
-def test_failure_tty(cmd, errmsg):
-    try:
-        ttyfd = open("/dev/tty", "rw")
-    except Exception, e:
-        logging.info(str(e))
-        logging.info("SKIP " + cmd)
-        return 0
+def test_failure(cmd, errmsg, tty=False):
+    if tty:
+        try:
+            ttyfd = open("/dev/tty", "rw")
+        except Exception, e:
+            logging.info(str(e))
+            logging.info("SKIP " + cmd)
+            return 0
     TMPFILE = r"/tmp/tmp.{pid}".format(pid=os.getpid())
     tmpfd = open(TMPFILE, "w")
 
     logging.debug(cmd)
-    ret = call(cmd, shell=True, stdin=ttyfd, stdout=ttyfd, stderr=tmpfd)
-    ttyfd.close()
+    if tty:
+        ret = call(cmd, shell=True, stdin=ttyfd, stdout=ttyfd, stderr=tmpfd)
+        ttyfd.close()
+    else:
+        ret = call(cmd, shell=True, stderr=tmpfd)
     tmpfd.close()
     if ret == 0:
         logging.error(cmd)
         logging.error("Should have failed, but got exit 0")
         return 1
     lines = get_lines(TMPFILE)
-    line = lines[0]
-    if line == errmsg:
-        logging.info("Correctly failed with message \"" + line + "\"")
+    matched = [ l for l in lines if errmsg in l ]
+    if any(matched):
+        logging.info("Correctly failed with message \"" + matched[0] + "\"")
         return 0
     else:
-        logging.error("Bad message to stderr \"" + line + "\"")
+        logging.error("Bad messages to stderr \"" + str(lines) + "\"")
         return 1
-
-
-def test_failure(cmd, errmsg):
-    logging.debug(cmd)
-    try:
-        check_output(cmd, stderr=subprocess.STDOUT, shell=True)
-        logging.error(cmd)
-        logging.error("Should have failed, but got exit 0")
-        return 1
-    except subprocess.CalledProcessError, e:
-        if errmsg in e.output:
-            logging.info("Correctly failed with message \"" + errmsg + "\"")
-            return 0
-        else:
-            errmsg = e.output.split('\n')[0]
-            logging.error("Bad message to stderr \"" + errmsg + "\"")
-            return 1
 
 
 def get_nspace(num):
@@ -354,6 +349,142 @@ def check_data(DATADIR, TMPFILE, OSDDIR, SPLIT_NAME):
                 logging.error("{file} data not imported properly into {obj}".format(file=file, obj=obj_loc))
                 ERRORS += 1
     return ERRORS, repcount
+
+
+def set_osd_weight(CFSD_PREFIX, osd_ids, osd_path, weight):
+    print "Testing get-osdmap and set-osdmap"
+    # change the weight of osd.0 to math.pi in the newest osdmap of given osd
+    osdmap_file = tempfile.NamedTemporaryFile()
+    cmd = (CFSD_PREFIX + "--op get-osdmap --file {osdmap_file}").format(osd=osd_path,
+                                                                        osdmap_file=osdmap_file.name)
+    output = check_output(cmd, shell=True)
+    epoch = int(re.findall('#(\d+)', output)[0])
+    
+    new_crush_file = tempfile.NamedTemporaryFile(delete=False)
+    old_crush_file = tempfile.NamedTemporaryFile(delete=False)
+    ret = call("./osdmaptool --export-crush {crush_file} {osdmap_file}".format(osdmap_file=osdmap_file.name,
+                                                                          crush_file=old_crush_file.name),
+               stdout=subprocess.DEVNULL,
+               stderr=subprocess.DEVNULL,
+               shell=True)
+    assert(ret == 0)
+
+    for osd_id in osd_ids:
+        cmd = "./crushtool -i {crush_file} --reweight-item osd.{osd} {weight} -o {new_crush_file}".format(osd=osd_id,
+                                                                                                          crush_file=old_crush_file.name,
+                                                                                                          weight=weight,
+                                                                                                          new_crush_file=new_crush_file.name)
+        ret = call(cmd, stdout=subprocess.DEVNULL, shell=True)
+        assert(ret == 0)
+        old_crush_file, new_crush_file = new_crush_file, old_crush_file
+
+    # change them back, since we don't need to preapre for another round
+    old_crush_file, new_crush_file = new_crush_file, old_crush_file
+    old_crush_file.close()
+
+    ret = call("./osdmaptool --import-crush {crush_file} {osdmap_file}".format(osdmap_file=osdmap_file.name,
+                                                                               crush_file=new_crush_file.name),
+               stdout=subprocess.DEVNULL,
+               stderr=subprocess.DEVNULL,
+               shell=True)
+    assert(ret == 0)
+    # osdmaptool increases the epoch of the changed osdmap, so we need to force the tool
+    # to use use a different epoch than the one in osdmap
+    cmd = CFSD_PREFIX + "--op set-osdmap --file {osdmap_file} --epoch {epoch} --force"
+    cmd = cmd.format(osd=osd_path, osdmap_file=osdmap_file.name, epoch=epoch)
+    ret = call(cmd, stdout=subprocess.DEVNULL, shell=True)
+    return ret == 0
+
+def get_osd_weights(CFSD_PREFIX, osd_ids, osd_path):
+    osdmap_file = tempfile.NamedTemporaryFile()
+    cmd = (CFSD_PREFIX + "--op get-osdmap --file {osdmap_file}").format(osd=osd_path,
+                                                                        osdmap_file=osdmap_file.name)
+    ret = call(cmd, stdout=subprocess.DEVNULL, shell=True)
+    if ret != 0:
+        return None
+    # we have to read the weights from the crush map, even we can query the weights using
+    # osdmaptool, but please keep in mind, they are different:
+    #    item weights in crush map versus weight associated with each osd in osdmap
+    crush_file = tempfile.NamedTemporaryFile(delete=False)
+    ret = call("./osdmaptool --export-crush {crush_file} {osdmap_file}".format(osdmap_file=osdmap_file.name,
+                                                                               crush_file=crush_file.name),
+               stdout=subprocess.DEVNULL,
+               shell=True)
+    assert(ret == 0)
+    output = check_output("./crushtool --tree -i {crush_file} | tail -n {num_osd}".format(crush_file=crush_file.name,
+                                                                                          num_osd=len(osd_ids)),
+                          stderr=subprocess.DEVNULL,
+                          shell=True)
+    weights = []
+    for line in output.strip().split('\n'):
+        osd_id, weight, osd_name = re.split('\s+', line)
+        weights.append(float(weight))
+    return weights
+
+
+def test_get_set_osdmap(CFSD_PREFIX, osd_ids, osd_paths):
+    print "Testing get-osdmap and set-osdmap"
+    errors = 0
+    kill_daemons()
+    weight = 1 / math.e           # just some magic number in [0, 1]
+    changed = []
+    for osd_path in osd_paths:
+        if set_osd_weight(CFSD_PREFIX, osd_ids, osd_path, weight):
+            changed.append(osd_path)
+        else:
+            logging.warning("Failed to change the weights: {0}".format(osd_path))
+    # i am pissed off if none of the store gets changed
+    if not changed:
+        errors += 1
+
+    for osd_path in changed:
+        weights = get_osd_weights(CFSD_PREFIX, osd_ids, osd_path)
+        if not weights:
+            errors += 1
+            continue
+        if any(abs(w - weight) > 1e-5 for w in weights):
+            logging.warning("Weight is not changed: {0} != {1}".format(weights, weight))
+            errors += 1
+    return errors
+
+def test_get_set_inc_osdmap(CFSD_PREFIX, osd_path):
+    # incrementals are not used unless we need to build an MOSDMap to update
+    # OSD's peers, so an obvious way to test it is simply overwrite an epoch
+    # with a different copy, and read it back to see if it matches.
+    kill_daemons()
+    file_e2 = tempfile.NamedTemporaryFile()
+    cmd = (CFSD_PREFIX + "--op get-inc-osdmap --file {file}").format(osd=osd_path,
+                                                                     file=file_e2.name)
+    output = check_output(cmd, shell=True)
+    epoch = int(re.findall('#(\d+)', output)[0])
+    # backup e1 incremental before overwriting it
+    epoch -= 1
+    file_e1_backup = tempfile.NamedTemporaryFile()
+    cmd = CFSD_PREFIX + "--op get-inc-osdmap --epoch {epoch} --file {file}"
+    ret = call(cmd.format(osd=osd_path, epoch=epoch, file=file_e1_backup.name), shell=True)
+    if ret: return 1
+    # overwrite e1 with e2
+    cmd = CFSD_PREFIX + "--op set-inc-osdmap --force --epoch {epoch} --file {file}"
+    ret = call(cmd.format(osd=osd_path, epoch=epoch, file=file_e2.name), shell=True)
+    if ret: return 1
+    # read from e1
+    file_e1_read = tempfile.NamedTemporaryFile(delete=False)
+    cmd = CFSD_PREFIX + "--op get-inc-osdmap --epoch {epoch} --file {file}"
+    ret = call(cmd.format(osd=osd_path, epoch=epoch, file=file_e1_read.name), shell=True)
+    if ret: return 1
+    errors = 0
+    try:
+        if not filecmp.cmp(file_e2.name, file_e1_read.name, shallow=False):
+            logging.error("{{get,set}}-inc-osdmap mismatch {0} != {1}".format(file_e2.name, file_e1_read.name))
+            errors += 1
+    finally:
+        # revert the change with file_e1_backup
+        cmd = CFSD_PREFIX + "--op set-inc-osdmap --epoch {epoch} --file {file}"
+        ret = call(cmd.format(osd=osd_path, epoch=epoch, file=file_e1_backup.name), shell=True)
+        if ret:
+            logging.error("Failed to revert the changed inc-osdmap")
+            errors += 1
+    return errors
 
 
 def main(argv):
@@ -586,11 +717,11 @@ def main(argv):
     print "Test invalid parameters"
     # On export can't use stdout to a terminal
     cmd = (CFSD_PREFIX + "--op export --pgid {pg}").format(osd=ONEOSD, pg=ONEPG)
-    ERRORS += test_failure_tty(cmd, "stdout is a tty and no --file filename specified")
+    ERRORS += test_failure(cmd, "stdout is a tty and no --file filename specified", tty=True)
 
     # On export can't use stdout to a terminal
     cmd = (CFSD_PREFIX + "--op export --pgid {pg} --file -").format(osd=ONEOSD, pg=ONEPG)
-    ERRORS += test_failure_tty(cmd, "stdout is a tty and no --file filename specified")
+    ERRORS += test_failure(cmd, "stdout is a tty and no --file filename specified", tty=True)
 
     # Prep a valid ec export file for import failure tests
     ONEECPG = ALLECPGS[0]
@@ -633,11 +764,11 @@ def main(argv):
 
     # On import can't use stdin from a terminal
     cmd = (CFSD_PREFIX + "--op import --pgid {pg}").format(osd=ONEOSD, pg=ONEPG)
-    ERRORS += test_failure_tty(cmd, "stdin is a tty and no --file filename specified")
+    ERRORS += test_failure(cmd, "stdin is a tty and no --file filename specified", tty=True)
 
     # On import can't use stdin from a terminal
     cmd = (CFSD_PREFIX + "--op import --pgid {pg} --file -").format(osd=ONEOSD, pg=ONEPG)
-    ERRORS += test_failure_tty(cmd, "stdin is a tty and no --file filename specified")
+    ERRORS += test_failure(cmd, "stdin is a tty and no --file filename specified", tty=True)
 
     # Specify a bad --type
     cmd = (CFSD_PREFIX + "--type foobar --op list --pgid {pg}").format(osd=ONEOSD, pg=ONEPG)
@@ -660,7 +791,7 @@ def main(argv):
 
     # Specify a bad --op command
     cmd = (CFSD_PREFIX + "--op oops").format(osd=ONEOSD)
-    ERRORS += test_failure(cmd, "Must provide --op (info, log, remove, export, import, list, fix-lost, list-pgs, rm-past-intervals, set-allow-sharded-objects, dump-journal, dump-super, meta-list)")
+    ERRORS += test_failure(cmd, "Must provide --op (info, log, remove, export, import, list, fix-lost, list-pgs, rm-past-intervals, set-allow-sharded-objects, dump-journal, dump-super, meta-list, get-osdmap, set-osdmap, get-inc-osdmap, set-inc-osdmap, mark-complete)")
 
     # Provide just the object param not a command
     cmd = (CFSD_PREFIX + "object").format(osd=ONEOSD)
@@ -1361,6 +1492,9 @@ def main(argv):
     call("/bin/rm -rf {dir}".format(dir=TESTDIR), shell=True)
     call("/bin/rm -rf {dir}".format(dir=DATADIR), shell=True)
 
+    # vstart() starts 4 OSDs
+    ERRORS += test_get_set_osdmap(CFSD_PREFIX, range(4), ALLOSDS)
+    ERRORS += test_get_set_inc_osdmap(CFSD_PREFIX, ALLOSDS[0])
     if ERRORS == 0:
         print "TEST PASSED"
         return 0

@@ -374,7 +374,7 @@ void PGMap::calc_stats()
 
   redo_full_sets();
 
-  calc_min_last_epoch_clean();
+  min_last_epoch_clean = calc_min_last_epoch_clean();
 }
 
 void PGMap::update_pg(pg_t pgid, bufferlist& bl)
@@ -694,6 +694,7 @@ void PGMap::dump_basic(Formatter *f) const
   f->dump_stream("stamp") << stamp;
   f->dump_unsigned("last_osdmap_epoch", last_osdmap_epoch);
   f->dump_unsigned("last_pg_scan", last_pg_scan);
+  f->dump_unsigned("min_last_epoch_clean", min_last_epoch_clean);
   f->dump_float("full_ratio", full_ratio);
   f->dump_float("near_full_ratio", nearfull_ratio);
   
@@ -703,6 +704,16 @@ void PGMap::dump_basic(Formatter *f) const
 
   f->open_object_section("osd_stats_sum");
   osd_sum.dump(f);
+  f->close_section();
+
+  f->open_object_section("osd_epochs");
+  for (ceph::unordered_map<int32_t,epoch_t>::const_iterator p =
+	 osd_epochs.begin(); p != osd_epochs.end(); ++p) {
+    f->open_object_section("osd");
+    f->dump_unsigned("osd", p->first);
+    f->dump_unsigned("epoch", p->second);
+    f->close_section();
+  }
   f->close_section();
 
   dump_delta(f);
@@ -1188,6 +1199,105 @@ void PGMap::pool_client_io_rate_summary(Formatter *f, ostream *out,
   client_io_rate_summary(f, out, p->second.first, ts->second);
 }
 
+void PGMap::cache_io_rate_summary(Formatter *f, ostream *out,
+                                  const pool_stat_t& delta_sum,
+                                  utime_t delta_stamp) const
+{
+  pool_stat_t pos_delta = delta_sum;
+  pos_delta.floor(0);
+  bool have_output = false;
+
+  if (pos_delta.stats.sum.num_flush) {
+    int64_t flush = (pos_delta.stats.sum.num_flush_kb << 10) / (double)delta_stamp;
+    if (f) {
+      f->dump_int("flush_bytes_sec", flush);
+    } else {
+      *out << pretty_si_t(flush) << "B/s flush";
+      have_output = true;
+    }
+  }
+  if (pos_delta.stats.sum.num_evict) {
+    int64_t evict = (pos_delta.stats.sum.num_evict_kb << 10) / (double)delta_stamp;
+    if (f) {
+      f->dump_int("evict_bytes_sec", evict);
+    } else {
+      if (have_output)
+	*out << ", ";
+      *out << pretty_si_t(evict) << "B/s evict";
+      have_output = true;
+    }
+  }
+  if (pos_delta.stats.sum.num_promote) {
+    int64_t promote = pos_delta.stats.sum.num_promote / (double)delta_stamp;
+    if (f) {
+      f->dump_int("promote_op_per_sec", promote);
+    } else {
+      if (have_output)
+	*out << ", ";
+      *out << pretty_si_t(promote) << "op/s promote";
+      have_output = true;
+    }
+  }
+  if (pos_delta.stats.sum.num_flush_mode_low) {
+    if (f) {
+      f->dump_int("num_flush_mode_low", pos_delta.stats.sum.num_flush_mode_low);
+    } else {
+      if (have_output)
+	*out << ", ";
+      *out << pretty_si_t(pos_delta.stats.sum.num_flush_mode_low) << "PG(s) flushing";
+      have_output = true;
+    }
+  }
+  if (pos_delta.stats.sum.num_flush_mode_high) {
+    if (f) {
+      f->dump_int("num_flush_mode_high", pos_delta.stats.sum.num_flush_mode_high);
+    } else {
+      if (have_output)
+	*out << ", ";
+      *out << pretty_si_t(pos_delta.stats.sum.num_flush_mode_high) << "PG(s) flushing (high)";
+      have_output = true;
+    }
+  }
+  if (pos_delta.stats.sum.num_evict_mode_some) {
+    if (f) {
+      f->dump_int("num_evict_mode_some", pos_delta.stats.sum.num_evict_mode_some);
+    } else {
+      if (have_output)
+	*out << ", ";
+      *out << pretty_si_t(pos_delta.stats.sum.num_evict_mode_some) << "PG(s) evicting";
+      have_output = true;
+    }
+  }
+  if (pos_delta.stats.sum.num_evict_mode_full) {
+    if (f) {
+      f->dump_int("num_evict_mode_full", pos_delta.stats.sum.num_evict_mode_full);
+    } else {
+      if (have_output)
+	*out << ", ";
+      *out << pretty_si_t(pos_delta.stats.sum.num_evict_mode_full) << "PG(s) evicting (full)";
+      have_output = true;
+    }
+  }
+}
+
+void PGMap::overall_cache_io_rate_summary(Formatter *f, ostream *out) const
+{
+  cache_io_rate_summary(f, out, pg_sum_delta, stamp_delta);
+}
+
+void PGMap::pool_cache_io_rate_summary(Formatter *f, ostream *out,
+                                       uint64_t poolid) const
+{
+  ceph::unordered_map<uint64_t,pair<pool_stat_t,utime_t> >::const_iterator p =
+    per_pool_sum_delta.find(poolid);
+  if (p == per_pool_sum_delta.end())
+    return;
+  ceph::unordered_map<uint64_t,utime_t>::const_iterator ts =
+    per_pool_sum_deltas_stamps.find(p->first);
+  assert(ts != per_pool_sum_deltas_stamps.end());
+  cache_io_rate_summary(f, out, p->second.first, ts->second);
+}
+
 /**
  * update aggregated delta
  *
@@ -1374,6 +1484,13 @@ void PGMap::print_summary(Formatter *f, ostream *out) const
   overall_client_io_rate_summary(f, &ssr);
   if (!f && ssr.str().length())
     *out << "  client io " << ssr.str() << "\n";
+
+  ssr.clear();
+  ssr.str("");
+
+  overall_cache_io_rate_summary(f, &ssr);
+  if (!f && ssr.str().length())
+    *out << "  cache io " << ssr.str() << "\n";
 }
 
 void PGMap::print_oneline_summary(Formatter *f, ostream *out) const
@@ -1460,11 +1577,14 @@ void PGMap::print_oneline_summary(Formatter *f, ostream *out) const
 void PGMap::generate_test_instances(list<PGMap*>& o)
 {
   o.push_back(new PGMap);
-  o.push_back(new PGMap);
   list<Incremental*> inc;
   Incremental::generate_test_instances(inc);
+  delete inc.front();
   inc.pop_front();
   while (!inc.empty()) {
+    PGMap *pmp = new PGMap();
+    *pmp = *o.back();
+    o.push_back(pmp);
     o.back()->apply_incremental(NULL, *inc.front());
     delete inc.front();
     inc.pop_front();

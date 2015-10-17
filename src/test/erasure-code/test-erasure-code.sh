@@ -25,7 +25,6 @@ function run() {
     export CEPH_MON="127.0.0.1:7101"
     export CEPH_ARGS
     CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
-    CEPH_ARGS+="--enable-experimental-unrecoverable-data-corrupting-features=shec "
     CEPH_ARGS+="--mon-host=$CEPH_MON "
 
     setup $dir || return 1
@@ -125,6 +124,7 @@ function rados_osds_out_in() {
     # implies the PG have been moved to use the remaining OSDs.  Check
     # the object can still be retrieved.
     #
+    wait_for_clean || return 1
     local osds_list=$(get_osds $poolname $objname)
     local -a osds=($osds_list)
     for osd in 0 1 ; do

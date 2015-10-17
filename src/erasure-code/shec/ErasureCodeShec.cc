@@ -53,6 +53,7 @@ int ErasureCodeShec::create_ruleset(const string &name,
   if (ruleid < 0) {
     return ruleid;
   } else {
+    crush.set_rule_mask_max_size(ruleid, get_chunk_count());
     return crush.get_rule_mask_ruleset(ruleid);
   }
 }
@@ -247,7 +248,6 @@ int ErasureCodeShec::decode_chunks(const set<int> &want_to_read,
       }
       avails[i] = 0;
     } else {
-      (*decoded)[i] = chunks.find(i)->second;
       avails[i] = 1;
     }
     if (i < k)
@@ -501,7 +501,8 @@ int* ErasureCodeShec::shec_reedsolomon_coding_matrix(int is_single)
         if (true) {
           double r_e1;
           r_e1 = shec_calc_recovery_efficiency1(k, m1, m2, c1, c2);
-          if (r_e1 < min_r_e1){
+          if (min_r_e1 - r_e1 > std::numeric_limits<double>::epsilon() &&
+	      r_e1 < min_r_e1) {
             min_r_e1 = r_e1;
             c1_best = c1;
             m1_best = m1;
@@ -560,6 +561,14 @@ int ErasureCodeShec::shec_make_decoding_matrix(bool prepare, int *want_, int *av
         }
       }
     }
+  }
+
+  if (tcache.getDecodingTableFromCache(decoding_matrix,
+                                       dm_row, dm_column, minimum,
+                                       technique,
+                                       k, m, c, w,
+                                       want, avails)) {
+    return 0;
   }
 
   for (unsigned long long pp = 0; pp < (1ull << m); ++pp) {
@@ -754,6 +763,9 @@ int ErasureCodeShec::shec_make_decoding_matrix(bool prepare, int *want_, int *av
   }
 
   int ret = jerasure_invert_matrix(tmpmat, decoding_matrix, mindup, w);
+
+  tcache.putDecodingTableToCache(decoding_matrix, dm_row, dm_column, minimum, technique,
+                                 k, m, c, w, want, avails);
 
   return ret;
 }

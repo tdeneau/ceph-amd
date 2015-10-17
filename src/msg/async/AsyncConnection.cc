@@ -23,6 +23,8 @@
 #include "AsyncMessenger.h"
 #include "AsyncConnection.h"
 
+#include "include/sock_compat.h"
+
 // Constant to limit starting sequence number to 2^31.  Nothing special about it, just a big number.  PLR
 #define SEQ_MASK  0x7fffffff 
 
@@ -536,7 +538,7 @@ void AsyncConnection::process()
           ldout(async_msgr->cct, 20) << __func__ << " begin MSG" << dendl;
           ceph_msg_header header;
           ceph_msg_header_old oldheader;
-          __u32 header_crc;
+          __u32 header_crc = 0;
           int len;
           if (has_feature(CEPH_FEATURE_NOSRCADDR))
             len = sizeof(header);
@@ -837,8 +839,8 @@ void AsyncConnection::process()
 
           // note last received message.
           in_seq.set(message->get_seq());
-          ldout(async_msgr->cct, 10) << __func__ << " got message " << message->get_seq()
-                               << " " << message << " " << *message << dendl;
+	  ldout(async_msgr->cct, 1) << " == rx == " << message->get_source() << " seq "
+                                    << message->get_seq() << " " << message << " " << *message << dendl;
 
           // if send_message always successfully send, it may have no
           // opportunity to send seq ack. 10 is a experience value.
@@ -897,40 +899,40 @@ void AsyncConnection::process()
           break;
         }
     }
-
-    continue;
-
-fail:
-    // clean up state internal variables and states
-    if (state >= STATE_CONNECTING_SEND_CONNECT_MSG &&
-        state <= STATE_CONNECTING_READY) {
-      delete authorizer;
-      authorizer = NULL;
-      got_bad_auth = false;
-    }
-
-    if (state > STATE_OPEN_MESSAGE_THROTTLE_MESSAGE &&
-        state <= STATE_OPEN_MESSAGE_READ_FOOTER_AND_DISPATCH
-        && policy.throttler_messages) {
-      ldout(async_msgr->cct,10) << __func__ << " releasing " << 1
-                          << " message to policy throttler "
-                          << policy.throttler_messages->get_current() << "/"
-                          << policy.throttler_messages->get_max() << dendl;
-      policy.throttler_messages->put();
-    }
-    if (state > STATE_OPEN_MESSAGE_THROTTLE_BYTES &&
-        state <= STATE_OPEN_MESSAGE_READ_FOOTER_AND_DISPATCH) {
-      uint64_t message_size = current_header.front_len + current_header.middle_len + current_header.data_len;
-      if (policy.throttler_bytes) {
-        ldout(async_msgr->cct,10) << __func__ << " releasing " << message_size
-                            << " bytes to policy throttler "
-                            << policy.throttler_bytes->get_current() << "/"
-                            << policy.throttler_bytes->get_max() << dendl;
-        policy.throttler_bytes->put(message_size);
-      }
-    }
-    fault();
   } while (prev_state != state);
+
+  return;
+
+ fail:
+  // clean up state internal variables and states
+  if (state >= STATE_CONNECTING_SEND_CONNECT_MSG &&
+      state <= STATE_CONNECTING_READY) {
+    delete authorizer;
+    authorizer = NULL;
+    got_bad_auth = false;
+  }
+
+  if (state > STATE_OPEN_MESSAGE_THROTTLE_MESSAGE &&
+      state <= STATE_OPEN_MESSAGE_READ_FOOTER_AND_DISPATCH
+      && policy.throttler_messages) {
+    ldout(async_msgr->cct,10) << __func__ << " releasing " << 1
+                        << " message to policy throttler "
+                        << policy.throttler_messages->get_current() << "/"
+                        << policy.throttler_messages->get_max() << dendl;
+    policy.throttler_messages->put();
+  }
+  if (state > STATE_OPEN_MESSAGE_THROTTLE_BYTES &&
+      state <= STATE_OPEN_MESSAGE_READ_FOOTER_AND_DISPATCH) {
+    uint64_t message_size = current_header.front_len + current_header.middle_len + current_header.data_len;
+    if (policy.throttler_bytes) {
+      ldout(async_msgr->cct,10) << __func__ << " releasing " << message_size
+                          << " bytes to policy throttler "
+                          << policy.throttler_bytes->get_current() << "/"
+                          << policy.throttler_bytes->get_max() << dendl;
+      policy.throttler_bytes->put(message_size);
+    }
+  }
+  fault();
 }
 
 int AsyncConnection::_process_connection()
@@ -975,7 +977,6 @@ int AsyncConnection::_process_connection()
         if (r < 0) {
           goto fail;
         }
-        net.set_socket_options(sd);
 
         center->create_file_event(sd, EVENT_READABLE, read_handler);
         state = STATE_CONNECTING_WAIT_BANNER;
@@ -1502,6 +1503,10 @@ int AsyncConnection::handle_connect_reply(ceph_msg_connect &connect, ceph_msg_co
   }
   if (reply.tag == CEPH_MSGR_TAG_WAIT) {
     ldout(async_msgr->cct, 3) << __func__ << " connect got WAIT (connection race)" << dendl;
+    if (!once_ready) {
+      ldout(async_msgr->cct, 1) << __func__ << " got WAIT while connection isn't registered, just closed." << dendl;
+      goto fail;
+    }
     state = STATE_WAIT;
   }
 
@@ -1735,6 +1740,7 @@ int AsyncConnection::handle_connect_msg(ceph_msg_connect &connect, bufferlist &a
   if (existing->policy.lossy) {
     // disconnect from the Connection
     existing->center->dispatch_event_external(existing->reset_handler);
+    ldout(async_msgr->cct, 1) << __func__ << " replacing on lossy channel, failing existing" << dendl;
     existing->_stop();
   } else {
     assert(can_write == NOWRITE);
@@ -1776,9 +1782,11 @@ int AsyncConnection::handle_connect_msg(ceph_msg_connect &connect, bufferlist &a
     existing->write_lock.Unlock();
     if (existing->_reply_accept(CEPH_MSGR_TAG_RETRY_GLOBAL, connect, reply, authorizer_reply) < 0) {
       // handle error
+      ldout(async_msgr->cct, 0) << __func__ << " reply fault for existing connection." << dendl;
       existing->fault();
     }
 
+    ldout(async_msgr->cct, 1) << __func__ << " stop myself to swap existing" << dendl;
     _stop();
     existing->lock.Unlock();
     return 0;
@@ -1918,7 +1926,14 @@ void AsyncConnection::accept(int incoming)
 
 int AsyncConnection::send_message(Message *m)
 {
-  ldout(async_msgr->cct, 10) << __func__ << " m=" << m << dendl;
+  ldout(async_msgr->cct, 1) << " == tx == " << m << " " << *m << dendl;
+
+  // optimistic think it's ok to encode(actually may broken now)
+  if (!m->get_priority())
+    m->set_priority(async_msgr->get_default_send_priority());
+
+  m->get_header().src = async_msgr->get_myname();
+  m->set_connection(this);
 
   if (async_msgr->get_myaddr() == get_peer_addr()) { //loopback connection
    ldout(async_msgr->cct, 20) << __func__ << " " << *m << " local" << dendl;
@@ -1934,10 +1949,6 @@ int AsyncConnection::send_message(Message *m)
 
   bufferlist bl;
   uint64_t f = get_features();
-
-  // optimistic think it's ok to encode(actually may broken now)
-  if (!m->get_priority())
-    m->set_priority(async_msgr->get_default_send_priority());
 
   // TODO: Currently not all messages supports reencode like MOSDMap, so here
   // only let fast dispatch support messages prepare message
@@ -1956,7 +1967,7 @@ int AsyncConnection::send_message(Message *m)
   }
   if (!is_queued() && can_write == CANWRITE) {
     if (!can_fast_prepare)
-      prepare_send_message(f, m, bl);
+      prepare_send_message(get_features(), m, bl);
     if (write_message(m, bl) < 0) {
       ldout(async_msgr->cct, 1) << __func__ << " send msg failed" << dendl;
       // we want to handle fault within internal thread
@@ -2059,7 +2070,7 @@ void AsyncConnection::fault()
   }
 
   if (policy.lossy && !(state >= STATE_CONNECTING && state < STATE_CONNECTING_READY)) {
-    ldout(async_msgr->cct, 10) << __func__ << " on lossy channel, failing" << dendl;
+    ldout(async_msgr->cct, 1) << __func__ << " on lossy channel, failing" << dendl;
     center->dispatch_event_external(reset_handler);
     _stop();
     return ;
@@ -2156,7 +2167,7 @@ void AsyncConnection::_stop()
   if (state == STATE_CLOSED)
     return ;
 
-  ldout(async_msgr->cct, 10) << __func__ << dendl;
+  ldout(async_msgr->cct, 1) << __func__ << dendl;
   Mutex::Locker l(write_lock);
   if (sd >= 0)
     center->delete_file_event(sd, EVENT_READABLE|EVENT_WRITABLE);
@@ -2185,8 +2196,6 @@ void AsyncConnection::prepare_send_message(uint64_t features, Message *m, buffer
   ldout(async_msgr->cct, 20) << __func__ << " m" << " " << *m << dendl;
 
   // associate message with Connection (for benefit of encode_payload)
-  m->get_header().src = async_msgr->get_myname();
-  m->set_connection(this);
   if (m->empty_payload())
     ldout(async_msgr->cct, 20) << __func__ << " encoding features "
                                << features << " " << m << " " << *m << dendl;
@@ -2324,7 +2333,7 @@ void AsyncConnection::send_keepalive()
 
 void AsyncConnection::mark_down()
 {
-  ldout(async_msgr->cct, 10) << __func__ << " started." << dendl;
+  ldout(async_msgr->cct, 1) << __func__ << " started." << dendl;
   Mutex::Locker l(lock);
   _stop();
 }
@@ -2449,8 +2458,8 @@ void AsyncConnection::local_deliver()
   ldout(async_msgr->cct, 10) << __func__ << dendl;
   Mutex::Locker l(write_lock);
   while (!local_messages.empty()) {
-    Message *m = local_messages.back();
-    local_messages.pop_back();
+    Message *m = local_messages.front();
+    local_messages.pop_front();
     m->set_connection(this);
     m->set_recv_stamp(ceph_clock_now(async_msgr->cct));
     ldout(async_msgr->cct, 10) << __func__ << " " << *m << " local deliver " << dendl;

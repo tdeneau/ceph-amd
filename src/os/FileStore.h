@@ -141,7 +141,10 @@ private:
   int init_index(coll_t c);
 
   void _kludge_temp_object_collection(coll_t& cid, const ghobject_t& oid) {
-    if (oid.hobj.pool < -1 && !cid.is_temp())
+    // - normal temp case: cid is pg, object is temp (pool < -1)
+    // - hammer temp case: cid is pg (or already temp), object pool is -1
+    if (cid.is_pg() && (oid.hobj.pool < -1 ||
+			oid.hobj.pool == -1))
       cid = cid.get_temp();
   }
   void init_temp_collections();
@@ -263,6 +266,7 @@ private:
       q.push_back(o);
     }
     Op *peek_queue() {
+      Mutex::Locker l(qlock);
       assert(apply_lock.is_locked());
       return q.front();
     }
@@ -304,7 +308,6 @@ private:
       Mutex::Locker l(qlock);
       uint64_t seq = 0;
       if (_get_max_uncompleted(&seq)) {
-	delete c;
 	return true;
       } else {
 	flush_commit_waiters.push_back(make_pair(seq, c));
@@ -330,11 +333,8 @@ private:
   FDCache fdcache;
   WBThrottle wbthrottle;
 
-  Sequencer default_osr;
   deque<OpSequencer*> op_queue;
-  uint64_t op_queue_len, op_queue_bytes;
-  Cond op_throttle_cond;
-  Mutex op_throttle_lock;
+  Throttle throttle_ops, throttle_bytes;
   Finisher op_finisher;
 
   ThreadPool op_tp;
@@ -363,6 +363,7 @@ private:
     void _process(OpSequencer *osr, ThreadPool::TPHandle &handle) {
       store->_do_op(osr, handle);
     }
+    using ThreadPool::WorkQueue<OpSequencer>::_process;
     void _process_finish(OpSequencer *osr) {
       store->_finish_op(osr);
     }
@@ -458,6 +459,10 @@ public:
    * return value: true if set_allow_sharded_objects() called, otherwise false
    */
   bool get_allow_sharded_objects();
+
+  bool can_sort_nibblewise() {
+    return true;    // i support legacy sort order
+  }
 
   void collect_metadata(map<string,string> *pm);
 
@@ -574,6 +579,7 @@ public:
   void flush();
   void sync_and_flush();
 
+  int flush_journal();
   int dump_journal(ostream& out);
 
   void set_fsid(uuid_d u) {
@@ -583,8 +589,8 @@ public:
 
   // DEBUG read error injection, an object is removed from both on delete()
   Mutex read_error_lock;
-  set<ghobject_t> data_error_set; // read() will return -EIO
-  set<ghobject_t> mdata_error_set; // getattr(),stat() will return -EIO
+  set<ghobject_t, ghobject_t::BitwiseComparator> data_error_set; // read() will return -EIO
+  set<ghobject_t, ghobject_t::BitwiseComparator> mdata_error_set; // getattr(),stat() will return -EIO
   void inject_data_error(const ghobject_t &oid);
   void inject_mdata_error(const ghobject_t &oid);
   void debug_obj_on_delete(const ghobject_t &oid);
@@ -604,29 +610,19 @@ public:
   int _rmattrs(coll_t cid, const ghobject_t& oid,
 	       const SequencerPosition &spos);
 
-  int collection_getattr(coll_t c, const char *name, void *value, size_t size);
-  int collection_getattr(coll_t c, const char *name, bufferlist& bl);
-  int collection_getattrs(coll_t cid, map<string,bufferptr> &aset);
-
-  int _collection_setattr(coll_t c, const char *name, const void *value, size_t size);
-  int _collection_rmattr(coll_t c, const char *name);
-  int _collection_setattrs(coll_t cid, map<string,bufferptr> &aset);
   int _collection_remove_recursive(const coll_t &cid,
 				   const SequencerPosition &spos);
 
   // collections
+  int collection_list(coll_t c, ghobject_t start, ghobject_t end,
+		      bool sort_bitwise, int max,
+		      vector<ghobject_t> *ls, ghobject_t *next);
   int list_collections(vector<coll_t>& ls);
   int list_collections(vector<coll_t>& ls, bool include_temp);
   int collection_version_current(coll_t c, uint32_t *version);
   int collection_stat(coll_t c, struct stat *st);
   bool collection_exists(coll_t c);
   bool collection_empty(coll_t c);
-  int collection_list(coll_t c, vector<ghobject_t>& oid);
-  int collection_list_partial(coll_t c, ghobject_t start,
-			      int min, int max, snapid_t snap,
-			      vector<ghobject_t> *ls, ghobject_t *next);
-  int collection_list_range(coll_t c, ghobject_t start, ghobject_t end,
-                            snapid_t seq, vector<ghobject_t> *ls);
 
   // omap (see ObjectStore.h for documentation)
   int omap_get(coll_t c, const ghobject_t &oid, bufferlist *header,
@@ -779,7 +775,7 @@ protected:
     return filestore->current_fn;
   }
   int _copy_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff) {
-    if (has_fiemap()) {
+    if (has_fiemap() || has_seek_data_hole()) {
       return filestore->_do_sparse_copy_range(from, to, srcoff, len, dstoff);
     } else {
       return filestore->_do_copy_range(from, to, srcoff, len, dstoff);
