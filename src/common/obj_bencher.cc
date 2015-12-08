@@ -698,7 +698,10 @@ int ObjBencher::seq_read_bench(int seconds_to_run, int num_objects, int concurre
     }
 
     newName = generate_object_name(data.started, pid);
-    if (newName.length() == 0) break;
+    if (newName.length() == 0) {
+      lock.Unlock();
+      break;
+    }
     index[slot] = data.started;
     lock.Unlock();
     completion_wait(slot);
